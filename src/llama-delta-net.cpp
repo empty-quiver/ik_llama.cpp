@@ -307,7 +307,8 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
         float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-        bool save_per_step_states, ggml_tensor * per_step_ckpt) {
+        bool save_per_step_states, ggml_tensor * per_step_ckpt,
+        ggml_tensor * spec_ckpt_shadow) {
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -331,6 +332,36 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     state_all = ggml_view_2d(ctx0, state_storage, state_dim, qnext_state_slots, state_row_size, 0);
 
     ggml_tensor * state_dst = ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size, state_seq_id_local * state_row_size);
+
+    // Fix 1a: in-graph SSM-state checkpoint save.
+    // Emit ggml_cpy(state_dst -> shadow) BEFORE any op below mutates state_dst.
+    // state_cpy on line ~411 is what writes back to state_dst; by expanding the
+    // shadow cpy here (and earlier than state_cpy below), the scheduler will
+    // place the save op at a lower cgraph node index. ggml's backend scheduler
+    // executes nodes in the order they appear in the cgraph within a backend
+    // split, so the save runs before the new-state writeback. The data copy
+    // rides whatever stream the backend uses for the rest of the layer; no
+    // extra synchronize is required on the spec-iter critical path. The
+    // matching no-op in checkpoint_save() (when save_per_step_ssm is true)
+    // avoids the synchronous tensor_get loop entirely.
+    if (spec_ckpt_shadow != nullptr && gf != nullptr) {
+        const int64_t shadow_elems = (int64_t)ggml_nelements(spec_ckpt_shadow);
+        // shadow is sized to match what restore consumes. In PER_STEP mode that
+        // is conv_state_dim floats (matches per_step_conv_state_dim). For the
+        // active sequence we read from offset 0 of state_dst (the row's start),
+        // which mirrors the existing PER_STEP semantics where the restore path
+        // reads the shadow at offset 0 and writes s_l[il] at offset 0.
+        if (shadow_elems > 0 && shadow_elems <= state_dim) {
+            ggml_tensor * src_view = ggml_view_1d(ctx0, state_dst, shadow_elems, 0);
+            ggml_tensor * dst_view = ggml_is_contiguous(spec_ckpt_shadow)
+                ? spec_ckpt_shadow
+                : ggml_view_1d(ctx0, spec_ckpt_shadow, shadow_elems, 0);
+            ggml_tensor * shadow_cpy = ggml_cpy(ctx0, src_view, dst_view);
+            cb(shadow_cpy, "spec_ckpt_save", il);
+            ggml_build_forward_expand(gf, shadow_cpy);
+        }
+    }
+
     ggml_tensor * state_f32 = state_dst;
     if (state_f32->type != GGML_TYPE_F32) {
         state_f32 = ggml_cast(ctx0, state_f32, GGML_TYPE_F32);
@@ -610,12 +641,25 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         ggml_build_forward_expand(gf, qkv_cpy);
     }
 
+    // Fix 1a: thread the spec-ckpt shadow tensor for this layer through to
+    // build_qkv so it can emit a fused ggml_cpy(s_l[il] -> shadow) at the
+    // start of the layer's recurrent-state read, BEFORE the state mutation.
+    // Gated on save_per_step_ssm (PER_STEP mode); split layers are
+    // intentionally not eligible for PER_STEP per spec_ckpt_try_per_step,
+    // so this path only runs for the non-split case here.
+    ggml_tensor * spec_ckpt_shadow = nullptr;
+    if (kv_self.save_per_step_ssm
+            && il < (int)kv_self.ckpt.s_l_shadow.size()
+            && kv_self.ckpt.s_l_shadow[il] != nullptr) {
+        spec_ckpt_shadow = kv_self.ckpt.s_l_shadow[il];
+    }
+
     auto output = build_qkv(ctx0, kv_self.s_l[il], model.layers[il].ssm_conv1d,
         qkv_mixed, inp_s_seq_qnext, beta, gate,
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf,
-        save_per_step_states, per_step_ckpt);
+        save_per_step_states, per_step_ckpt, spec_ckpt_shadow);
 
     auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb);
     if (inp_out_ids) {

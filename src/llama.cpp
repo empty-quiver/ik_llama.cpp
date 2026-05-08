@@ -1262,7 +1262,11 @@ bool llama_kv_cache::checkpoint_alloc_shadows() {
     };
 
     const bool conv_only_shadow = save_per_step_ssm && ckpt.per_step_conv_state_dim > 0;
-    std::vector<tensor_entry> nonsplit_entries;
+    // Group non-split entries by their backend buft so each shadow lives on the
+    // SAME buft as its primary. This is required for Fix 1a's in-graph save:
+    // emitting ggml_cpy(s_l[il] -> shadow) only stays on a single backend's
+    // stream (no cross-backend forced sync) when both endpoints share buft.
+    std::map<ggml_backend_buffer_type_t, std::vector<tensor_entry>> nonsplit_buft_entries;
 
     std::map<ggml_backend_buffer_type_t, std::vector<tensor_entry>> split_buft_entries;
 
@@ -1282,13 +1286,16 @@ bool llama_kv_cache::checkpoint_alloc_shadows() {
             }
             split_s_idx++;
         } else {
-            nonsplit_entries.push_back({s_l[il], il, -1});
+            ggml_backend_buffer_type_t buft = s_l[il]->buffer
+                ? ggml_backend_buffer_get_type(s_l[il]->buffer)
+                : ggml_backend_cpu_buffer_type();
+            nonsplit_buft_entries[buft].push_back({s_l[il], il, -1});
         }
     }
 
-    if (!nonsplit_entries.empty()) {
+    for (auto & [buft, entries] : nonsplit_buft_entries) {
         ggml_init_params params = {
-            /*.mem_size   =*/ nonsplit_entries.size() * ggml_tensor_overhead(),
+            /*.mem_size   =*/ entries.size() * ggml_tensor_overhead(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -1298,7 +1305,7 @@ bool llama_kv_cache::checkpoint_alloc_shadows() {
             return false;
         }
 
-        for (auto & entry : nonsplit_entries) {
+        for (auto & entry : entries) {
             // Only need the conv portion when per-step is active.
             const int64_t nelems = conv_only_shadow
                 ? ckpt.per_step_conv_state_dim
@@ -1308,14 +1315,16 @@ bool llama_kv_cache::checkpoint_alloc_shadows() {
             ckpt.s_l_shadow[entry.il] = shadow;
         }
 
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (!buf) {
-            LLAMA_LOG_ERROR("%s: failed to allocate CPU buffer for shadow tensors\n", __func__);
+            LLAMA_LOG_ERROR("%s: failed to allocate shadow buffer for buft %s\n",
+                            __func__, ggml_backend_buft_name(buft));
             ggml_free(ctx);
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: CPU shadow buffer = %8.2f MiB (%s)\n", __func__,
+        LLAMA_LOG_INFO("%s: %10s shadow buffer = %8.2f MiB (%s)\n", __func__,
+                       ggml_backend_buffer_name(buf),
                        ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
                        conv_only_shadow ? "conv-state only" : "full recurrent state");
         ckpt.shadow_ctxs.push_back(ctx);
@@ -1394,6 +1403,18 @@ bool llama_kv_cache::checkpoint_save() {
     ckpt.head_snapshot  = head;
     ckpt.used_snapshot  = used;
 
+    // Fix 1a: in PER_STEP mode the recurrent-state save is fused into the verify
+    // cgraph (a ggml_cpy(s_l[il] -> shadow) op emitted at the start of each
+    // recurrent layer's build, BEFORE state mutation). The data copy will run
+    // on the same backend stream as the rest of the verify decode and incurs
+    // no extra synchronize. We only need to snapshot the cells/head/used
+    // metadata here; the per-layer tensor_get loop is skipped.
+    if (save_per_step_ssm) {
+        ckpt.saved = true;
+        return true;
+    }
+
+    // Synchronous fallback path (LLAMA_SPEC_CKPT_GPU_FALLBACK).
     uint32_t split_s_idx = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (s_l[il] == nullptr) {
@@ -1410,8 +1431,12 @@ bool llama_kv_cache::checkpoint_save() {
             }
             split_s_idx++;
         } else {
-            const size_t nbytes = ggml_nbytes(ckpt.s_l_shadow[il]);
-            ggml_backend_tensor_get(s_l[il], ckpt.s_l_shadow[il]->data, 0, nbytes);
+            // Fix 1a: shadow now lives on the same backend buft as s_l[il]
+            // (possibly GPU). Use ggml_backend_tensor_copy which handles
+            // same-backend D2D and cross-backend D2H/H2D correctly. The
+            // previous code passed shadow->data as a host pointer, which
+            // is a GPU virtual address when shadow is on a GPU buffer.
+            ggml_backend_tensor_copy(s_l[il], ckpt.s_l_shadow[il]);
         }
     }
 
@@ -1419,7 +1444,7 @@ bool llama_kv_cache::checkpoint_save() {
     return true;
 }
 
-bool llama_kv_cache::checkpoint_restore() {
+bool llama_kv_cache::checkpoint_restore(ggml_backend_sched_t sched) {
     if (!ckpt.saved) {
         LLAMA_LOG_ERROR("%s: no checkpoint saved\n", __func__);
         return false;
@@ -1430,6 +1455,27 @@ bool llama_kv_cache::checkpoint_restore() {
     cells = ckpt.cells_snapshot;
     head  = ckpt.head_snapshot;
     used  = ckpt.used_snapshot;
+
+    // Fix 1a: when a scheduler is available, copy shadow -> s_l asynchronously
+    // on each tensor's own backend (shadow now lives on the same buft as s_l)
+    // and synchronize the touched backends at the end. This replaces the
+    // per-layer synchronous copy that incurred 2*n_layer backend stream syncs.
+    std::vector<ggml_backend_t> touched_backends;
+    auto issue_async = [&](ggml_tensor * src, ggml_tensor * dst) -> bool {
+        if (!sched || !src->buffer || !dst->buffer) return false;
+        int idx = ggml_backend_sched_get_backend_idx(sched, dst->buffer);
+        if (idx < 0) return false;
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, idx);
+        if (!backend) return false;
+        // Same backend on both sides (alloc enforces same buft).
+        ggml_backend_tensor_copy_async(backend, backend, src, dst);
+        bool already = false;
+        for (ggml_backend_t b : touched_backends) {
+            if (b == backend) { already = true; break; }
+        }
+        if (!already) touched_backends.push_back(backend);
+        return true;
+    };
 
     uint32_t split_s_idx = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
@@ -1442,14 +1488,23 @@ bool llama_kv_cache::checkpoint_restore() {
             auto & shadow_split = ckpt.split_s_l_shadow[split_s_idx];
             for (int d = 0; d < split_info->n_device; ++d) {
                 if (split_info->splits[d] && shadow_split[d]) {
-                    ggml_backend_tensor_copy(shadow_split[d], split_info->splits[d]);
+                    if (!issue_async(shadow_split[d], split_info->splits[d])) {
+                        ggml_backend_tensor_copy(shadow_split[d], split_info->splits[d]);
+                    }
                 }
             }
             split_s_idx++;
         } else {
             GGML_ASSERT(ggml_nbytes(ckpt.s_l_shadow[il]) == ggml_nbytes(s_l[il]));
-            ggml_backend_tensor_copy(ckpt.s_l_shadow[il], s_l[il]);
+            if (!issue_async(ckpt.s_l_shadow[il], s_l[il])) {
+                ggml_backend_tensor_copy(ckpt.s_l_shadow[il], s_l[il]);
+            }
         }
+    }
+
+    // Single trailing synchronize per touched backend instead of one per layer.
+    for (ggml_backend_t b : touched_backends) {
+        ggml_backend_synchronize(b);
     }
 
     return true;
@@ -7052,7 +7107,7 @@ bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
         }
 
         case LLAMA_SPEC_CKPT_GPU_FALLBACK:
-            kv.checkpoint_restore();
+            kv.checkpoint_restore(ctx->sched);
             llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
             return false;
 

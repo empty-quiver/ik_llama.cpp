@@ -138,7 +138,7 @@ struct llama_kv_cache {
     bool checkpoint_alloc_shadows();
     bool checkpoint_supported() const;
     bool checkpoint_save();
-    bool checkpoint_restore();
+    bool checkpoint_restore(ggml_backend_sched_t sched = nullptr);
     void checkpoint_delete();
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
