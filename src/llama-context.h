@@ -137,13 +137,16 @@ struct llama_kv_cache {
 
     bool checkpoint_alloc_shadows();
     bool checkpoint_supported() const;
-    bool checkpoint_save();
-    bool checkpoint_restore();
+    // sched is optional: when non-null, save/restore use the async tensor copy
+    // path with a single trailing synchronize per backend; when null, the legacy
+    // synchronous path is used.
+    bool checkpoint_save(ggml_backend_sched_t sched = nullptr);
+    bool checkpoint_restore(ggml_backend_sched_t sched = nullptr);
     void checkpoint_delete();
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
     bool per_step_alloc(int max_tokens);
-    bool per_step_restore(int step);
+    bool per_step_restore(int step, ggml_backend_sched_t sched = nullptr);
 
     ~llama_kv_cache() {
         for (struct ggml_context * ctx : ctxs) {
