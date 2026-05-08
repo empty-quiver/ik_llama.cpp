@@ -70,8 +70,9 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         GGML_ASSERT((uint32_t) s < qnext_state_slots);
     }
 
-    int max_per_step = lctx.kv_self.save_per_step_ssm ? std::min<int>(8, lctx.kv_self.ckpt.per_step_max_allocated) : 0;
-    save_per_step_states = lctx.kv_self.save_per_step_ssm && batch.n_tokens > 1 && batch.n_tokens <= max_per_step;
+    // PR3: per-step SSM state saving for legacy spec_ckpt has been removed.
+    // Hybrid speculation uses metadata-only seq_cp + eager row copy now.
+    save_per_step_states = false;
 }
 
 delta_net::~delta_net() = default;
@@ -609,29 +610,14 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     auto [beta, gate] = build_beta_gate(lctx, ctx0, model.layers[il].ssm_beta_alpha, model.layers[il].ssm_beta, model.layers[il].ssm_alpha,
             model.layers[il].ssm_dt, model.layers[il].ssm_a, num_k_heads, num_v_heads, n_seqs, cur, il, cb, gf);
 
-    // Get per-step checkpoint tensor if available
-    ggml_tensor * per_step_ckpt = nullptr;
-    if (save_per_step_states && il < (int)kv_self.ckpt.per_step_ssm.size()) {
-        per_step_ckpt = kv_self.ckpt.per_step_ssm[il];
-    }
-
-    // Save qkv_mixed features for per-step conv state reconstruction
-    if (save_per_step_states && il < (int)kv_self.ckpt.per_step_qkv.size() && kv_self.ckpt.per_step_qkv[il] != nullptr) {
-        const int64_t conv_dim = qkv_mixed->ne[0];
-        const int64_t n_tok_qkv = qkv_mixed->ne[1] * qkv_mixed->ne[2];
-        ggml_tensor * qkv_flat = ggml_reshape_2d(ctx0, qkv_mixed, conv_dim, n_tok_qkv);
-        ggml_tensor * qkv_dst = ggml_view_2d(ctx0, kv_self.ckpt.per_step_qkv[il],
-                conv_dim, n_tok_qkv, conv_dim * sizeof(float), 0);
-        auto qkv_cpy = ggml_cpy(ctx0, qkv_flat, qkv_dst);
-        ggml_build_forward_expand(gf, qkv_cpy);
-    }
-
+    // PR3: per-step SSM state saves are gone (legacy spec_ckpt machinery
+    // removed). save_per_step_states is always false here.
     auto output = build_qkv(ctx0, kv_self.s_l[il], model.layers[il].ssm_conv1d,
         qkv_mixed, inp_s_copy_qnext, inp_s_copy_row, beta, gate,
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf,
-        save_per_step_states, per_step_ckpt);
+        /*save_per_step_states=*/false, /*per_step_ckpt=*/nullptr);
 
     auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb);
     if (inp_out_ids) {

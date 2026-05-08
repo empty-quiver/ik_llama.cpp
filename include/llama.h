@@ -802,7 +802,12 @@ extern "C" {
     LLAMA_API void llama_kv_cache_clear(
             struct llama_context * ctx);
 
-    // Unified checkpoint API for recurrent/hybrid speculative decoding.
+    // DEPRECATED (PR3): the unified checkpoint API is no longer used by the
+    // built-in server. Hybrid speculative decoding now uses
+    // llama_kv_cache_seq_cp + an internal eager recurrent-row copy. These
+    // symbols are preserved as no-op stubs for one release for downstream
+    // embedders linking against the previous ABI; future releases will
+    // remove them entirely.
     enum llama_spec_ckpt_mode {
         LLAMA_SPEC_CKPT_NONE        = -1,
         LLAMA_SPEC_CKPT_AUTO        =  0,
@@ -811,17 +816,17 @@ extern "C" {
         LLAMA_SPEC_CKPT_CPU         =  3,
     };
 
-    // Initialise the checkpoint system for the upcoming speculation window.
+    // [DEPRECATED] returns LLAMA_SPEC_CKPT_NONE (no-op stub).
     LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
 
-    // Save the current recurrent state as a speculative checkpoint.
+    // [DEPRECATED] returns false (no-op stub).
     LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
 
-    // Restore the recurrent state after speculative decode.
+    // [DEPRECATED] returns false (no-op stub).
     LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
                                             llama_pos n_past, int accepted_step);
 
-    // Discard the saved checkpoint and reset internal mode state.
+    // [DEPRECATED] no-op stub.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
