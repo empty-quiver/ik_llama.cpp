@@ -3312,7 +3312,22 @@ void server_context::add_sampled_tokens() {
                 }
             }
 
-            llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+            // PR4: if slot.drafted is already populated, this is a partial-reject
+            // carryover from speculative_decoding_accept's fast-drop path.
+            // Reuse it as this iteration's draft (mirrors mainline's
+            // `slot.spec_draft = std::move(accepted)` reuse) — this skips the
+            // drafter call AND breaks the would-be infinite loop because the
+            // carryover draft contains the prior cycle's disagreed-but-sampled
+            // token at the disagree position, which by construction matches
+            // what the (RNG-restored) sampler will produce again.
+            llama_tokens draft;
+            const bool draft_is_carryover = !slot.drafted.empty();
+            if (draft_is_carryover) {
+                draft = std::move(slot.drafted);
+                slot.drafted.clear();
+            } else {
+                draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+            }
 
             const int n_draft_max = slot.get_n_draft_max();
 
@@ -3340,7 +3355,11 @@ void server_context::add_sampled_tokens() {
             }
             else {
                 // keep track of total number of drafted tokens tested
-                slot.n_draft_total += draft.size();
+                // (don't double-count the partial-reject carryover; those
+                // were already counted on the cycle that originally drafted them)
+                if (!draft_is_carryover) {
+                    slot.n_draft_total += draft.size();
+                }
 
                 // add all drafted tokens to the batch
                 for (size_t i = 0; i < draft.size(); i++) {
@@ -4018,6 +4037,72 @@ void server_context::speculative_decoding_accept() {
         slot.i_batch_dft.clear();
         slot.drafted.clear();
 
+        // PR4: on partial-reject for non-MTP recurrent/hybrid arch, follow
+        // mainline llama.cpp's design — do NOT commit accepted tokens, do NOT
+        // stream them to the client, do NOT advance any slot counters. Just
+        // restore the pre-spec recurrent + attn state via ON_DEVICE, drop the
+        // draft, and let the next drafting cycle redo the work from
+        // slot.sampled (which is unchanged since the prior full-accept). The
+        // saved sampler clone re-rolls the RNG so the next accept run is
+        // deterministic. This eliminates the re-decode of accepted tokens
+        // that PR3 did, recovering most of the perf gap to mainline.
+        //
+        // MTP and full-accept paths still need the original commit-then-
+        // advance flow because:
+        //  - MTP must capture verify-decode embeddings AND advance the draft
+        //    model's state; both paths are coupled.
+        //  - Full-accept never enters the restore path, so committing is the
+        //    only way to advance state.
+        const bool any_rejected = (ids.size() - 1) < n_draft;
+        const bool fast_drop = any_rejected && slot.spec_ckpt.valid && !slot.has_mtp;
+
+        if (fast_drop) {
+            // Restore recurrent + attn state byte-for-byte; the snapshot lives
+            // in ctx->mem_storage[slot.id] and is dispatched as a single bulk
+            // D2D via the ON_DEVICE flag.
+            const llama_state_seq_flags flags =
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+            const size_t n = llama_state_seq_set_data(ctx, slot.spec_ckpt.data.data(),
+                                                       slot.spec_ckpt.data.size(),
+                                                       slot.id, flags);
+            if (n == 0) {
+                SLT_ERR(slot, "%s", "ON_DEVICE restore failed in fast-drop path; falling through to legacy commit\n");
+                // fall through to legacy path (commit + restore_speculative_checkpoint)
+            } else {
+                // Wipe any leftover KV cells past the snapshot's pos_max (the
+                // verify decode wrote them; they're stale).
+                llama_kv_cache_seq_rm(ctx, slot.id, slot.spec_ckpt.pos_max + 1, -1);
+
+                // Roll the slot's accounting back to pre-spec. add_sampled_tokens()
+                // on the prior cycle had pushed [slot.sampled, draft...] onto
+                // cache_tokens; we drop them so the next cycle's
+                // add_sampled_tokens() pushes a fresh sampled-token at the
+                // right position.
+                slot.cache_tokens.keep_first(slot.spec_ckpt.n_past);
+                slot.n_past = slot.spec_ckpt.n_past;
+
+                // Restore sampler state (RNG / prev / mirostat). slot.sampled
+                // is intentionally NOT updated — next iteration re-drafts from
+                // the prior full-accept's last token, exactly as mainline.
+                if (slot.spec_ckpt.sampler) {
+                    common_sampler_clone(slot.spec_ckpt.sampler, slot.ctx_sampling);
+                }
+
+                // Mainline reuse trick: stash `ids` (the accepted prefix +
+                // disagreed-sample) as the next iteration's draft. Skipping
+                // the drafter call AND including the disagreed_sample as the
+                // last "draft" token guarantees the next verify+accept pass
+                // converges (typically to full-accept), avoiding what would
+                // otherwise be a verify→reject→re-verify loop on the same
+                // RNG-restored sampler state.
+                slot.drafted = std::move(ids);
+
+                discard_speculative_checkpoint(slot, ctx);
+                continue;
+            }
+        }
+
+        // ---- Legacy / full-accept / MTP path: commit accepted tokens ----
         slot.n_past += ids.size();
         slot.n_decoded += ids.size();
         const int64_t t_current = ggml_time_us();
@@ -4037,8 +4122,8 @@ void server_context::speculative_decoding_accept() {
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
-        // for recurrent/hybrid models: if any drafts were rejected, restore recurrent state
-        const bool any_rejected = (ids.size() - 1) < n_draft;
+        // for recurrent/hybrid MTP: if any drafts were rejected, restore recurrent state
+        // (and re-decode to capture fresh embeddings for the MTP draft model)
         if (any_rejected && slot.spec_ckpt.valid) {
             restore_speculative_checkpoint(slot, ctx, model, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base);
         } else {
