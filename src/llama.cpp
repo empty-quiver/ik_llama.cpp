@@ -1361,22 +1361,37 @@ static bool llama_kv_cache_seq_rm(
 // that the destination slot has its own snapshot of the parent state, surviving
 // the verify decode that writes back into seq_id_src's row.
 //
-// Implementation (post-review): we still bounce the row through a host scratch
-// buffer (the source and destination are different offsets within the SAME
-// tensor, which the ggml inter-tensor copy interface does not support directly),
-// but the per-layer get+set use the async helpers and we drain with a SINGLE
-// ggml_backend_synchronize per fork instead of the implicit 128 (64 layers x
-// {get,set}) cudaStreamSynchronize the synchronous path forces. On CUDA this
-// elides ~6 ms of round-trip latency per spec-decode fork, which is what was
-// driving the 34% perf regression vs PR2 reported in review.
+// Implementation (post-review v2): the source and destination are different
+// rows of the SAME tensor `t`. We do this as a device-to-device copy on the
+// backend that owns t, dispatched async with a single trailing synchronize.
 //
-// Caveat: the CUDA tensor_set_async path issues cudaMemcpyAsync H2D from the
-// caller's host pointer. With pageable (non-pinned) source memory that call is
-// synchronous wrt the host — it copies into a CUDA-managed staging area before
-// returning, so the host buffer is safe to reuse on the next iteration without
-// an explicit sync, but the dispatched D2D copy still queues onto the stream
-// and overlaps with subsequent launches. The trailing ggml_backend_synchronize
-// is what guarantees the destination row is observable before the next gather.
+// The trick: ggml_backend_tensor_copy_async expects two distinct ggml_tensor
+// arguments, but the CUDA cpy_tensor_async path only looks at ne[]/nb[],
+// data, view_src, and buffer. We construct two temporary 1d-row "stub"
+// tensors in a scratch ggml context (no_alloc), point each at a different
+// row of t, and patch the buffer field so the CUDA backend recognizes them
+// as device-resident. That gets us onto a single cudaMemcpyAsync(D2D) per
+// layer with no implicit stream sync — drained by one ggml_backend_synchronize
+// at the end of the fork.
+//
+// Why not bounce through host (the v1 of this fix did that with
+// get_async + set_async): the CUDA async tensor_get / tensor_set helpers
+// only accept HOST destinations / sources. With pageable host memory, the
+// CUDA driver actually serves cudaMemcpyAsync synchronously w.r.t. the
+// host (it has to stage through pinned memory and that staging blocks),
+// which means the "async" helpers were not async at all in our use. v1
+// only recovered ~9 t/s of the lost ~25 t/s.
+//
+// D2D within the same buffer doesn't touch host memory at all, so each
+// copy is a queued GPU-side memcpy with effectively no host cost beyond
+// the launch itself (~5 µs on Ampere). 64 layers x 5 µs = 0.3 ms/fork,
+// vs the ~6 ms/fork the sync get+set path was costing.
+//
+// Fallback: if the backend's cpy_tensor_async returns false (e.g. CPU
+// backend, where it's NULL in the iface table), ggml_backend_tensor_copy_async
+// falls through to a synchronizing ggml_backend_tensor_copy which works
+// correctly but takes the slow path. CPU is rarely the backend for s_l
+// when GPU offload is on, so this is a no-op in practice.
 static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
                                           ggml_backend_sched_t   sched,
                                           llama_seq_id           seq_id_src,
@@ -1392,8 +1407,33 @@ static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
         return false;
     }
 
-    // Scratch buffer reused across layers.
-    std::vector<uint8_t> scratch;
+    // Transient ggml context for the stub view tensors. no_alloc: we never
+    // allocate data here, the views just borrow t's data pointer at offsets.
+    // Sized for ~256 stub tensors (worst case: 64 layers x 4 splits x 2
+    // src/dst views) at GGML_TENSOR_SIZE+padding each — generous.
+    const size_t ctx_size = ggml_tensor_overhead() * 8 * cache.s_l.size() + 1024;
+    std::vector<uint8_t> ctx_mem(ctx_size);
+    ggml_init_params iparams = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ ctx_mem.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    if (ctx == nullptr) {
+        // Should not happen — fall back to synchronous host bounce.
+        std::vector<uint8_t> scratch;
+        for (uint32_t il = 0; il < cache.s_l.size(); ++il) {
+            ggml_tensor * s_l = cache.s_l[il];
+            if (s_l == nullptr || s_l->extra != nullptr) continue;
+            const size_t row_size = ggml_row_size(s_l->type, s_l->ne[0]);
+            const size_t off_src  = (size_t) seq_id_src * row_size;
+            const size_t off_dst  = (size_t) seq_id_dst * row_size;
+            if (scratch.size() < row_size) scratch.resize(row_size);
+            ggml_backend_tensor_get(s_l, scratch.data(), off_src, row_size);
+            ggml_backend_tensor_set(s_l, scratch.data(), off_dst, row_size);
+        }
+        return true;
+    }
 
     // Set of backends that received async work and must be drained at the end.
     // Almost always size 1 (single CUDA device), but graph-split can spread
@@ -1406,37 +1446,47 @@ static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
         async_backends.push_back(b);
     };
 
+    // Lazy host scratch — only allocated if we have to fall back to the
+    // synchronous path on some layer.
+    std::vector<uint8_t> scratch;
+
     auto copy_row_within = [&](ggml_tensor * t) {
         // s_l shape: ne[0] = state_dim, ne[1] = qnext_state_slots.
         const size_t row_size  = ggml_row_size(t->type, t->ne[0]);
         const size_t off_src   = (size_t) seq_id_src * row_size;
         const size_t off_dst   = (size_t) seq_id_dst * row_size;
-        if (scratch.size() < row_size) {
-            scratch.resize(row_size);
-        }
+
         ggml_backend_t b = llama_spec_ckpt_backend_for_tensor(sched, t);
         if (b != nullptr) {
-            // Async D2H followed by async H2D on the same backend stream.
-            // Stream ordering guarantees the get completes before the set
-            // reads from the staging buffer, and the trailing synchronize
-            // below drains both before we return. set_async on CUDA copies
-            // host->staging synchronously (when source is pageable), so the
-            // scratch buffer is safe to reuse for the next layer without
-            // additional fences.
-            ggml_backend_tensor_get_async(b, t, scratch.data(), off_src, row_size);
-            // The get_async dispatches a D2H copy; on CUDA with pageable
-            // dst that is host-synchronous (the copy completes before the
-            // call returns), so scratch.data() holds the row contents and
-            // the immediately following set_async H2D reads valid bytes.
-            ggml_backend_tensor_set_async(b, t, scratch.data(), off_dst, row_size);
-            note_backend(b);
-        } else {
-            // Backend not resolvable (CPU-only build, or sched=nullptr in some
-            // exotic path). Fall back to the synchronous round-trip — slower
-            // but still correct.
-            ggml_backend_tensor_get(t, scratch.data(), off_src, row_size);
-            ggml_backend_tensor_set(t, scratch.data(), off_dst, row_size);
+            // Build two 1-d row views of `t` in the transient context. The
+            // views inherit t's data pointer at the right offset and t's
+            // dtype, but their `buffer` field starts as NULL (ggml views
+            // normally route through view_src->buffer). The CUDA
+            // cpy_tensor_async path checks `src->buffer` directly though
+            // (not buf_src), so we patch buffer in to the underlying device
+            // buffer. ggml_backend_tensor_copy_async will then take the
+            // single cudaMemcpyAsync(D2D) fast path.
+            ggml_tensor * v_src = ggml_view_1d(ctx, t, t->ne[0], off_src);
+            ggml_tensor * v_dst = ggml_view_1d(ctx, t, t->ne[0], off_dst);
+            if (v_src != nullptr && v_dst != nullptr) {
+                ggml_backend_buffer_t buf =
+                    t->view_src ? t->view_src->buffer : t->buffer;
+                v_src->buffer = buf;
+                v_dst->buffer = buf;
+                ggml_backend_tensor_copy_async(b, b, v_src, v_dst);
+                note_backend(b);
+                return;
+            }
+            // ctx exhausted (unexpected) — fall through to sync path.
         }
+
+        // Backend not resolvable (CPU-only build, or sched=nullptr in some
+        // exotic path) or stub-tensor allocation failed. Fall back to the
+        // synchronous round-trip — slower but still correct.
+        if (scratch.size() < row_size) scratch.resize(row_size);
+        ggml_backend_tensor_get(t, scratch.data(), off_src, row_size);
+        ggml_backend_tensor_set(t, scratch.data(), off_dst, row_size);
+        (void) row_size;
     };
 
     for (uint32_t il = 0; il < cache.s_l.size(); ++il) {
@@ -1457,13 +1507,14 @@ static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
         }
     }
 
-    // ONE sync per backend that received async work, instead of the implicit
-    // ~128 (64 layers x {get,set}) cudaStreamSynchronize the sync path forces.
-    // This is what recovers the perf parity with PR2.
+    // ONE sync per backend that received async work. Without this, the
+    // dispatched D2D copies could still be in flight when the next gather
+    // reads from cache.s_l[il].
     for (auto * b : async_backends) {
         ggml_backend_synchronize(b);
     }
 
+    ggml_free(ctx);
     return true;
 }
 
