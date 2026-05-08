@@ -1244,6 +1244,33 @@ static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache, uin
 // shadow-buffer machinery — the public llama_spec_ckpt_* API is preserved
 // as deprecated no-op stubs at the bottom of this file for one release.
 
+// Resolve the backend handle (within the sched) that owns the given tensor's
+// buffer, so we can use its async tensor_get / tensor_set path without
+// per-call synchronization. Returns nullptr if no match (caller must fall
+// back to the synchronous path). Restored from Fix 1b — qnext_copy_row
+// needs it to elide 128 implicit cudaStreamSynchronize per fork.
+static ggml_backend_t llama_spec_ckpt_backend_for_tensor(ggml_backend_sched_t sched, const struct ggml_tensor * t) {
+    if (sched == nullptr || t == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    if (buft == nullptr) {
+        return nullptr;
+    }
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n_backends; ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (b != nullptr && ggml_backend_supports_buft(b, buft)) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
 static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     for (int32_t i = 0; i < (int32_t) cache.size; ++i) {
         cache.cells[i].pos = -1;
@@ -1334,15 +1361,26 @@ static bool llama_kv_cache_seq_rm(
 // that the destination slot has its own snapshot of the parent state, surviving
 // the verify decode that writes back into seq_id_src's row.
 //
-// Implementation: for each layer (and each split, when graph-split is in effect)
-// read the source row out via ggml_backend_tensor_get and write it back to the
-// destination row via ggml_backend_tensor_set. This is a D2H+H2D round-trip per
-// row, but the row size is small (per-slot recurrent state of a single layer)
-// and the verify cycle ratio is 1 fork per N draft tokens, so the cost is
-// negligible relative to the verify decode itself.
+// Implementation (post-review): we still bounce the row through a host scratch
+// buffer (the source and destination are different offsets within the SAME
+// tensor, which the ggml inter-tensor copy interface does not support directly),
+// but the per-layer get+set use the async helpers and we drain with a SINGLE
+// ggml_backend_synchronize per fork instead of the implicit 128 (64 layers x
+// {get,set}) cudaStreamSynchronize the synchronous path forces. On CUDA this
+// elides ~6 ms of round-trip latency per spec-decode fork, which is what was
+// driving the 34% perf regression vs PR2 reported in review.
+//
+// Caveat: the CUDA tensor_set_async path issues cudaMemcpyAsync H2D from the
+// caller's host pointer. With pageable (non-pinned) source memory that call is
+// synchronous wrt the host — it copies into a CUDA-managed staging area before
+// returning, so the host buffer is safe to reuse on the next iteration without
+// an explicit sync, but the dispatched D2D copy still queues onto the stream
+// and overlaps with subsequent launches. The trailing ggml_backend_synchronize
+// is what guarantees the destination row is observable before the next gather.
 static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
-                                          llama_seq_id   seq_id_src,
-                                          llama_seq_id   seq_id_dst) {
+                                          ggml_backend_sched_t   sched,
+                                          llama_seq_id           seq_id_src,
+                                          llama_seq_id           seq_id_dst) {
     if (!llama_kv_has_qnext_state_storage(cache)) {
         return true;
     }
@@ -1357,6 +1395,17 @@ static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
     // Scratch buffer reused across layers.
     std::vector<uint8_t> scratch;
 
+    // Set of backends that received async work and must be drained at the end.
+    // Almost always size 1 (single CUDA device), but graph-split can spread
+    // s_l across multiple devices.
+    std::vector<ggml_backend_t> async_backends;
+    async_backends.reserve(4);
+    auto note_backend = [&](ggml_backend_t b) {
+        if (b == nullptr) return;
+        for (auto * x : async_backends) if (x == b) return;
+        async_backends.push_back(b);
+    };
+
     auto copy_row_within = [&](ggml_tensor * t) {
         // s_l shape: ne[0] = state_dim, ne[1] = qnext_state_slots.
         const size_t row_size  = ggml_row_size(t->type, t->ne[0]);
@@ -1365,8 +1414,29 @@ static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
         if (scratch.size() < row_size) {
             scratch.resize(row_size);
         }
-        ggml_backend_tensor_get(t, scratch.data(), off_src, row_size);
-        ggml_backend_tensor_set(t, scratch.data(), off_dst, row_size);
+        ggml_backend_t b = llama_spec_ckpt_backend_for_tensor(sched, t);
+        if (b != nullptr) {
+            // Async D2H followed by async H2D on the same backend stream.
+            // Stream ordering guarantees the get completes before the set
+            // reads from the staging buffer, and the trailing synchronize
+            // below drains both before we return. set_async on CUDA copies
+            // host->staging synchronously (when source is pageable), so the
+            // scratch buffer is safe to reuse for the next layer without
+            // additional fences.
+            ggml_backend_tensor_get_async(b, t, scratch.data(), off_src, row_size);
+            // The get_async dispatches a D2H copy; on CUDA with pageable
+            // dst that is host-synchronous (the copy completes before the
+            // call returns), so scratch.data() holds the row contents and
+            // the immediately following set_async H2D reads valid bytes.
+            ggml_backend_tensor_set_async(b, t, scratch.data(), off_dst, row_size);
+            note_backend(b);
+        } else {
+            // Backend not resolvable (CPU-only build, or sched=nullptr in some
+            // exotic path). Fall back to the synchronous round-trip — slower
+            // but still correct.
+            ggml_backend_tensor_get(t, scratch.data(), off_src, row_size);
+            ggml_backend_tensor_set(t, scratch.data(), off_dst, row_size);
+        }
     };
 
     for (uint32_t il = 0; il < cache.s_l.size(); ++il) {
@@ -1387,11 +1457,19 @@ static bool llama_kv_cache_qnext_copy_row(struct llama_kv_cache & cache,
         }
     }
 
+    // ONE sync per backend that received async work, instead of the implicit
+    // ~128 (64 layers x {get,set}) cudaStreamSynchronize the sync path forces.
+    // This is what recovers the perf parity with PR2.
+    for (auto * b : async_backends) {
+        ggml_backend_synchronize(b);
+    }
+
     return true;
 }
 
 static void llama_kv_cache_seq_cp(
         struct llama_kv_cache & cache,
+        ggml_backend_sched_t    sched,
                  llama_seq_id   seq_id_src,
                  llama_seq_id   seq_id_dst,
                     llama_pos   p0,
@@ -1441,7 +1519,7 @@ static void llama_kv_cache_seq_cp(
         // leaving the post-verify garbage in place. Treating each seq_cp as a
         // real physical fork (and setting cells[dst].src = dst) keeps the
         // pre-spec snapshot unambiguously live in row seq_id_dst from then on.
-        const bool ok = llama_kv_cache_qnext_copy_row(cache, seq_id_src, seq_id_dst);
+        const bool ok = llama_kv_cache_qnext_copy_row(cache, sched, seq_id_src, seq_id_dst);
         if (!ok) {
             LLAMA_LOG_WARN("%s: qnext eager row copy failed (%d -> %d)\n",
                 __func__, (int) seq_id_src, (int) seq_id_dst);
@@ -6702,7 +6780,7 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
     if (seq_id_src == seq_id_dst) {
         return;
     }
-    llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
+    llama_kv_cache_seq_cp(ctx->kv_self, ctx->sched, seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
