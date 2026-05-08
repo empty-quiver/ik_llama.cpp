@@ -67,6 +67,15 @@ static bool save_speculative_checkpoint(server_slot & slot, llama_model * model,
     slot.spec_ckpt.sampled = slot.sampled;
 
     const int max_tokens = (int)slot.drafted.size() + 1;
+
+    // NOTE: a slot-level cache of the actual_mode was attempted here, but
+    // llama_spec_ckpt_discard() (always called after every batch via
+    // discard_speculative_checkpoint or restore_speculative_checkpoint) resets
+    // kv.ckpt.selected_spec_mode to LLAMA_SPEC_CKPT_NONE. Without a public API
+    // to re-set the mode without re-running selection, llama_spec_ckpt_save
+    // would dispatch on NONE and silently fail. So we always call init; the
+    // per-step buffer alloc inside it short-circuits when the previously-seen
+    // max_tokens is sufficient (see per_step_alloc in src/llama.cpp).
     const int actual_mode = llama_spec_ckpt_init(ctx, ckpt_mode, max_tokens);
     if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
         return false;
@@ -4614,6 +4623,14 @@ void server_context::update_slots() {
 
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
+                continue;
+            }
+            // Skip the snapshot if there are no draft tokens to verify. This
+            // covers the case where the n_min guard cleared slot.drafted but
+            // i_batch_dft still holds the sampled-token slot, as well as any
+            // path where draft.size() == 0 with n_min == 0. Without drafts
+            // there is nothing to roll back to, so the save is wasted work.
+            if (slot.drafted.empty()) {
                 continue;
             }
             if (save_speculative_checkpoint(slot, model, ctx, ckpt_mode)) {
