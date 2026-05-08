@@ -780,6 +780,11 @@ extern "C" {
     // work only with partial states, such as recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
+    // keep the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load)
+    // PR1 scaffolding: when set, dispatch routes through llama_data_{write,read}_device, which
+    // for now mirror the host-bounce path. PR2/PR3 will add the real on-device snapshot path.
+#define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+
     typedef uint32_t llama_state_seq_flags;
 
     // Create an empty KV cache view. (use only for debugging purposes)

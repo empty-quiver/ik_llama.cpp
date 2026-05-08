@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-cparams.h"
 #include "llama-sampling.h"
+#include "ggml-cpp.h"
 
 struct llama_model;
 
@@ -10,6 +11,25 @@ struct llama_model;
 #include <map>
 #include <set>
 #include <memory>
+
+// Stores a copy of the memory in a device buffer, used for fast state save/load.
+// This is the per-buft companion to llama_context::mem_storage.
+//
+// PR1 scaffolding note: this struct is only populated by the (forthcoming) ON_DEVICE
+// path. Until PR2/PR3 land, no caller writes to mem_storage and these structures stay
+// empty.
+struct llama_memory_buffer {
+    int     n_tensors  = 0;
+    size_t  total_size = 0;
+
+    ggml_backend_buffer_ptr buf;
+    ggml_context_ptr        ctx;
+
+    std::vector<ggml_tensor *> org;
+    std::vector<ggml_tensor *> cpy;
+};
+
+using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_kv_cell {
     llama_pos pos   = -1;
@@ -183,6 +203,15 @@ struct llama_context {
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+
+    // per-sequence on-device snapshots, indexed by seq_id then by ggml_backend_buffer_type_t.
+    // Used by LLAMA_STATE_SEQ_FLAGS_ON_DEVICE in llama_state_seq_get_data / llama_state_seq_set_data.
+    // Cleared in ~llama_context.
+    //
+    // PR1 scaffolding: this map is declared and dispatch wiring uses it, but until PR2/PR3 land
+    // the device write/read classes fall back to the host bounce path and never insert anything
+    // into this map.
+    std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     // whether we are computing encoder output or decoder output
     bool is_encoding = false;

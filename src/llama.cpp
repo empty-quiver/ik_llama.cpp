@@ -676,6 +676,13 @@ void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
 }
 
 llama_context::~llama_context() {
+    // Drop on-device snapshots first: their llama_memory_buffer entries hold
+    // ggml_backend_buffer_ptr / ggml_context_ptr smart pointers that need to
+    // run their deleters before we tear down the backends.  PR1 leaves this
+    // map empty in practice (no writer populates it yet) but the clear is
+    // sequenced now to match the intended ordering for PR2/PR3.
+    mem_storage.clear();
+
     ggml_backend_sched_free(sched);
 
     for (ggml_backend_t backend : backends) {
@@ -7843,6 +7850,66 @@ struct llama_data_read_buffer : llama_data_read {
     }
 };
 
+// =============================================================================
+// PR1 scaffolding: on-device save/load classes for LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
+//
+// The mainline llama.cpp project keeps a per-seq map of backend-resident snapshot
+// buffers (llama_context::mem_storage) so that llama_state_seq_get_data with the
+// ON_DEVICE flag can defer the H2D/D2H bounce: write_tensor records (tensor, ptr,
+// offset, size) tuples and the destructor performs a single
+// ggml_backend_tensor_copy from each cache tensor into a parallel
+// device-resident buffer (one per ggml_backend_buffer_type_t).
+//
+// This PR1 is the SCAFFOLDING piece. The classes below subclass the existing
+// host-bounce classes and PR1 leaves them behaviorally identical — the
+// llama_memory_buffers reference they hold is a touch point for the map slot but
+// nothing in PR1 inserts into it. PR2 replaces the bodies with the real
+// device-side staging (collect-then-bulk-copy) and PR3 wires the corresponding
+// fast-path readback / consolidation cleanups.
+//
+// Why this shape now: ik's llama_data_write already has a pure-virtual
+// write_tensor_data(tensor, offset, size, il), so the abstract base does not
+// need a new method (mainline has to add one). The only structural addition
+// here is the per-context mem_storage map (in llama-context.h) which the
+// destructors of the device classes can flush into in PR2.
+// =============================================================================
+
+struct llama_data_write_device : llama_data_write_buffer {
+    llama_memory_buffers & mbufs;
+
+    llama_data_write_device(uint8_t * p, size_t len, const llama_model & _model, llama_memory_buffers & _mbufs)
+        : llama_data_write_buffer(p, len, _model), mbufs(_mbufs) {
+        // PR1: no-op constructor body. PR2 will lazily allocate per-buft device
+        // staging tensors here / in the destructor.
+        (void)mbufs;  // silence unused warnings until PR2 starts using it
+    }
+
+    // PR1 falls back to the host-bounce write_tensor_data inherited from
+    // llama_data_write_buffer. PR2 will override this to record (tensor, ptr,
+    // offset, size) tuples and flush them as ggml_backend_tensor_copy in the
+    // destructor.
+    //
+    // Note: split tensors (tensor->extra != nullptr) and the recurrent-layer
+    // aux-buffer path are intrinsically host-side — the device fast-path will
+    // detect those in PR2 and delegate to the inherited host implementation.
+};
+
+struct llama_data_read_device : llama_data_read_buffer {
+    const llama_memory_buffers & mbufs;
+
+    llama_data_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & _mbufs)
+        : llama_data_read_buffer(p, len), mbufs(_mbufs) {
+        // PR1: no-op constructor body. PR2 will validate that the per-buft
+        // staging tensors here match the layout written by the prior
+        // llama_data_write_device for this seq_id.
+        (void)mbufs;
+    }
+
+    // PR1 inherits read / read_to verbatim. PR2 will override read_tensor_data
+    // (added then) to perform a single ggml_backend_tensor_copy from the
+    // pre-staged device buffer into the live cache tensor.
+};
+
 struct llama_data_write_file : llama_data_write {
     llama_file * file;
     size_t size_written = 0;
@@ -8075,9 +8142,21 @@ size_t llama_state_seq_get_size(struct llama_context * ctx, llama_seq_id seq_id,
 }
 
 size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    llama_data_write_buffer data_ctx(dst, size, ctx->model);
+    // PR1 dispatch: when LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is set, route through
+    // llama_data_write_device. In PR1 the device class subclasses the host
+    // buffer class and behaves identically; the only observable difference is
+    // that mem_storage[seq_id] is touched (creating an empty entry if it did
+    // not exist). PR2 will give the device class real device-staging behavior.
+    std::unique_ptr<llama_data_write> data_ctx;
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        data_ctx = std::unique_ptr<llama_data_write>(
+            new llama_data_write_device(dst, size, ctx->model, ctx->mem_storage[seq_id]));
+    } else {
+        data_ctx = std::unique_ptr<llama_data_write>(
+            new llama_data_write_buffer(dst, size, ctx->model));
+    }
     try {
-        return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
+        return llama_state_seq_get_data_internal(ctx, *data_ctx, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state: %s\n", __func__, err.what());
         return 0;
@@ -8093,9 +8172,26 @@ static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llam
 }
 
 size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags) {
-    llama_data_read_buffer data_ctx(src, size);
+    // PR1 dispatch (mirrors llama_state_seq_get_data above). For ON_DEVICE the
+    // mainline reference reads a small magic+seq_id header to look up the
+    // matching mem_storage slot before constructing the read context. In PR1
+    // the device class is layout-compatible with the buffer class so we can
+    // skip that pre-read and let the inner state_seq_read_data run as usual.
+    // PR2 will reintroduce the magic/header check once write_device actually
+    // diverges from the buffer layout.
+    std::unique_ptr<llama_data_read> data_ctx;
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        // GUARD: with ON_DEVICE, fall back gracefully if the seq's mem_storage
+        // entry is missing (PR2 will populate it on the matching write side).
+        // For PR1 the entry is always empty, so we just use the empty slot.
+        data_ctx = std::unique_ptr<llama_data_read>(
+            new llama_data_read_device(src, size, ctx->mem_storage[dest_seq_id]));
+    } else {
+        data_ctx = std::unique_ptr<llama_data_read>(
+            new llama_data_read_buffer(src, size));
+    }
     try {
-        return llama_state_seq_set_data_internal(ctx, data_ctx, dest_seq_id, flags);
+        return llama_state_seq_set_data_internal(ctx, *data_ctx, dest_seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what());
         return 0;
