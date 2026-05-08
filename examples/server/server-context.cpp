@@ -46,8 +46,8 @@ static void log_text(const gpt_params & params_base, const std::string & text) {
 
 void server_speculative_checkpoint::clear() {
     valid = false;
-    seq_cp_active = false;
-    draft_seq_id = -1;
+    data.clear();
+    pos_max = -1;
     n_past = 0;
     sampled = LLAMA_TOKEN_NULL;
 
@@ -57,51 +57,43 @@ void server_speculative_checkpoint::clear() {
     }
 }
 
-// PR2: pick a draft seq_id that does not collide with user slots.
-// Layout: user slots use ids [0, n_parallel); draft branches live in
-// [n_parallel, 2*n_parallel) so slot.id and slot.id + n_parallel are paired.
-// n_seq_max is bumped to 2*n_parallel at load_model time when a drafter is
-// configured for a hybrid model (see load_model).
-static llama_seq_id pick_draft_seq_id(const server_slot & slot, int n_parallel) {
-    return (llama_seq_id) (slot.id + n_parallel);
-}
-
-static void discard_speculative_checkpoint(server_slot & slot, llama_context * ctx) {
-    if (slot.spec_ckpt.seq_cp_active && slot.spec_ckpt.draft_seq_id >= 0) {
-        // Drop the draft branch entirely (metadata-only on qnext layers, seq_id
-        // erase on the transformer KV cache).
-        llama_kv_cache_seq_rm(ctx, slot.spec_ckpt.draft_seq_id, -1, -1);
-    }
+static void discard_speculative_checkpoint(server_slot & slot, llama_context * /*ctx*/) {
+    // PR3: no draft-branch seq_id to erase — the snapshot lives in ctx->mem_storage
+    // (keyed by slot.id) and gets reused / overwritten by the next save call.
+    // We just drop the metadata buffer and saved sampler.
     slot.spec_ckpt.clear();
 }
 
-// Hybrid path: metadata-only fork via seq_cp paired with eager D2D recurrent-state
-// row copy (PR3 fix; see llama_kv_cache_qnext_copy_row in src/llama.cpp). Returns
-// true if the fork was set up.
-static bool save_speculative_checkpoint_seq_cp(server_slot & slot, llama_model * model,
-                                                llama_context * ctx, int n_parallel) {
+// PR3: replace the seq_cp/seq_rm fork with an ON_DEVICE snapshot. The actual
+// per-seq KV state (attn cells + qnext recurrent rows) is captured byte-for-byte
+// in ctx->mem_storage[slot.id]. The host-side metadata buffer (`slot.spec_ckpt.data`)
+// only holds positions / tensor sizes / io_magic — enough to feed
+// llama_state_seq_set_data on restore. Replaces save_speculative_checkpoint_seq_cp.
+static bool save_speculative_checkpoint_ondevice(server_slot & slot, llama_model * model,
+                                                  llama_context * ctx) {
     slot.spec_ckpt.clear();
     slot.spec_ckpt.n_past = slot.n_past - (int32_t)(slot.drafted.size() + 1);
     slot.spec_ckpt.sampled = slot.sampled;
-    slot.spec_ckpt.seq_cp_active = true;
-    slot.spec_ckpt.draft_seq_id = pick_draft_seq_id(slot, n_parallel);
+    slot.spec_ckpt.pos_max = llama_kv_cache_seq_pos_max(ctx, slot.id);
 
-    // Make sure no stale tokens are sitting in the draft branch (e.g. from a previous
-    // verify cycle that didn't clean up because the slot id was reused).
-    llama_kv_cache_seq_rm(ctx, slot.spec_ckpt.draft_seq_id, -1, -1);
+    const llama_state_seq_flags flags =
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    const size_t ckpt_size = llama_state_seq_get_size(ctx, slot.id, flags);
+    if (ckpt_size == 0) {
+        SLT_WRN(slot, "%s", "ON_DEVICE snapshot size 0; skipping checkpoint\n");
+        return false;
+    }
 
-    // Fork the live slot into the draft branch. For hybrid (qnext) state this is
-    // (metadata) cells[draft_seq_id].src = slot.id PLUS an eager physical row copy
-    // of the recurrent state from slot.id to draft_seq_id. The eager copy is what
-    // makes the partial-reject restore correct: the verify decode writes back to
-    // slot.id's row, but draft_seq_id retains its own pre-spec snapshot.
-    // The transformer KV (full attention layers) rotates by seq_id sets which is
-    // also cheap.
-    llama_kv_cache_seq_cp(ctx, slot.id, slot.spec_ckpt.draft_seq_id, 0, slot.spec_ckpt.n_past);
+    slot.spec_ckpt.data.resize(ckpt_size);
+    const size_t n = llama_state_seq_get_data(ctx, slot.spec_ckpt.data.data(), ckpt_size, slot.id, flags);
+    if (n != ckpt_size) {
+        SLT_WRN(slot, "ON_DEVICE snapshot size mismatch: got %zu want %zu\n", n, ckpt_size);
+        slot.spec_ckpt.clear();
+        return false;
+    }
 
     slot.spec_ckpt.sampler = common_sampler_init(model, slot.sparams);
     if (slot.spec_ckpt.sampler == nullptr) {
-        llama_kv_cache_seq_rm(ctx, slot.spec_ckpt.draft_seq_id, -1, -1);
         slot.spec_ckpt.clear();
         return false;
     }
@@ -152,29 +144,11 @@ server_context::~server_context() {
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
 
-    // PR2: ensure the target ctx has room for the draft-branch seq id when a drafter is
-    // configured. The seq_cp/seq_rm fork path picks draft seq id = slot.id + n_parallel,
-    // so the kv cache must support at least 2*n_parallel sequences. Both mparams.n_seq_max
-    // and cparams.n_seq_max derive from params.n_parallel in common.cpp, so we temporarily
-    // bump n_parallel for the duration of model+context construction, then restore it so
-    // the slot-creation loop in init() still produces the user-requested number of slots.
-    // Cost is one extra qnext state row per user slot (a few MB at most for 27B/IQ3_M).
-    const int saved_n_parallel = params_base.n_parallel;
-    const bool has_draft = !params_base.speculative.model.empty() ||
-                           !params_base.speculative.params.empty();
-    if (has_draft) {
-        const int requested = 2 * std::max(saved_n_parallel, 1);
-        if (params_base.n_parallel < requested) {
-            LOG_INFO("speculative: bumping n_seq_max to fit draft branch",
-                { {"prev", saved_n_parallel}, {"new", requested} });
-            params_base.n_parallel = requested;
-        }
-    }
+    // PR3: ON_DEVICE snapshot replaces the seq_cp/seq_rm draft-branch fork, so
+    // we no longer need to allocate extra seq slots for draft branches. n_seq_max
+    // tracks n_parallel directly (the user-requested number of slots).
 
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
-
-    // Restore so init() creates the user-requested number of slots, not 2x.
-    params_base.n_parallel = saved_n_parallel;
 
     model = llama_init.model;
     ctx = llama_init.context;
@@ -3883,42 +3857,58 @@ void server_context::extend_context(const int32_t n_tokens) {
     }
 }
 
-// Restore recurrent state and re-decode accepted tokens after speculative-decode rejection.
-// PR3: only the seq_cp (hybrid) path remains. Pure recurrent (Mamba/RWKV) speculation
-// no longer goes through this restore — save_speculative_checkpoint_seq_cp is now the
-// only entry point and only fires for hybrid arches.
+// PR3: ON_DEVICE-based restore. The full pre-speculation KV state (attn cells +
+// qnext recurrent rows) is captured byte-for-byte in ctx->mem_storage[slot.id]
+// at save time. On partial reject we restore that state in one D2D dispatch via
+// llama_state_seq_set_data, then re-decode just the accepted tokens to advance
+// the live slot to the post-accept position. The win vs PR3-stack-1 is at save
+// time: no per-row eager qnext_copy_row, just deferred bulk D2D mirror through
+// the multi-buft pipeline. The re-decode of accepted tokens is unavoidable
+// because ik commits accepted tokens to the slot's cache_tokens / output stream
+// (see speculative_decoding_accept) before this restore runs, and the live
+// recurrent state must be advanced to match.
 static void restore_speculative_checkpoint(
         server_slot & slot, llama_context * ctx, llama_model * /*model*/,
         const std::vector<llama_token> & ids, int n_draft,
         const std::vector<float> & /*mtp_hidden_state_pre*/, int32_t /*mtp_n_past_base*/) {
-    GGML_ASSERT(slot.spec_ckpt.seq_cp_active);
+    GGML_ASSERT(slot.spec_ckpt.valid);
+    GGML_ASSERT(!slot.spec_ckpt.data.empty());
 
-    // Hybrid path. The pre-speculation state is preserved on the draft branch
-    // (the live slot received the draft tokens during verify decode). Truncate the
-    // draft branch to the accepted prefix and copy it back to the live slot.
-    // For the qnext recurrent rows we (a) trim the live slot's positions past the
-    // accepted prefix, (b) seq_cp(draft -> slot.id) which sets cells[slot.id].src
-    // to draft_seq_id so subsequent gathers route reads through draft_seq_id's row
-    // — and that row is the pre-spec snapshot we eagerly copied at fork time.
-    // Then re-decode the accepted tokens to advance the recurrent state of slot.id.
     const int n_accepted = (int) ids.size();
     const llama_pos n_past_pre = slot.spec_ckpt.n_past;
-    const llama_seq_id draft_seq = slot.spec_ckpt.draft_seq_id;
+    const llama_pos pos_max_pre = slot.spec_ckpt.pos_max;
 
-    // Wipe everything in the live slot from n_past_pre forward — these are speculation
-    // tokens the verify decode wrote that we are about to re-do via the accepted path.
-    llama_kv_cache_seq_rm(ctx, slot.id, n_past_pre, -1);
-    // Restore the live slot from the saved branch.
-    llama_kv_cache_seq_cp(ctx, draft_seq, slot.id, 0, n_past_pre);
-    // Drop the draft branch.
-    llama_kv_cache_seq_rm(ctx, draft_seq, -1, -1);
+    // Restore the pre-spec KV state byte-for-byte. ON_DEVICE means the actual
+    // tensor bytes come from the staged mem_storage[slot.id] mirror via a
+    // single bulk D2D dispatch; the host-side `data` buffer carries only the
+    // metadata (positions, tensor sizes, magic+seq_id header).
+    const llama_state_seq_flags flags =
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    const size_t n = llama_state_seq_set_data(ctx, slot.spec_ckpt.data.data(),
+                                              slot.spec_ckpt.data.size(),
+                                              slot.id, flags);
+    if (n == 0) {
+        SLT_ERR(slot, "%s", "ON_DEVICE restore failed; speculative state may be inconsistent\n");
+        discard_speculative_checkpoint(slot, ctx);
+        return;
+    }
+
+    // Truncate any cells past the snapshot's pos_max (the verify decode wrote
+    // them and they're stale now — set_data already restored attn cells in
+    // [0, pos_max] but live cells beyond that are leftover from the spec batch).
+    llama_kv_cache_seq_rm(ctx, slot.id, pos_max_pre + 1, -1);
 
     if (slot.spec_ckpt.sampler) {
         common_sampler_clone(slot.spec_ckpt.sampler, slot.ctx_sampling);
     }
 
     if (n_accepted > 0) {
-        // Re-decode the accepted tokens to advance the recurrent state of slot.id.
+        // Re-decode just the accepted tokens to advance the recurrent state of
+        // slot.id to the post-accept position. This is the same shape as
+        // PR3-stack-1's re-decode; the savings vs that path are at save time
+        // (no eager per-row qnext_copy_row) and at restore (no seq_rm/seq_cp/
+        // seq_rm chain on the qnext layers — all of that collapsed into the
+        // single D2D dispatch above).
         llama_batch re_batch = llama_batch_init(n_accepted, 0, 1);
         common_batch_add(re_batch, slot.spec_ckpt.sampled, n_past_pre, { slot.id }, n_accepted == 1);
         for (int j = 0; j < n_accepted - 1; j++) {
@@ -3934,7 +3924,7 @@ static void restore_speculative_checkpoint(
 
         const int ret = llama_decode(ctx, re_batch);
         if (ret != 0) {
-            SLT_ERR(slot, "failed to re-decode accepted tokens after seq_cp restore: %d\n", ret);
+            SLT_ERR(slot, "failed to re-decode accepted tokens after ON_DEVICE restore: %d\n", ret);
         }
         if (slot.has_mtp) {
             const int n_embd = llama_model_n_embd(llama_get_model(ctx));
@@ -3961,7 +3951,7 @@ static void restore_speculative_checkpoint(
             common_sampler_accept(slot.ctx_sampling, ctx, id, true);
         }
         llama_batch_free(re_batch);
-        SLT_DBG(slot, "seq_cp restore: re-decoded %d tokens (rejected %d drafts)\n",
+        SLT_DBG(slot, "ON_DEVICE restore: re-decoded %d tokens (rejected %d drafts)\n",
             n_accepted, (int)(n_draft - (ids.size() - 1)));
     }
     discard_speculative_checkpoint(slot, ctx);
@@ -4646,23 +4636,22 @@ void server_context::update_slots() {
 
     if (llama_model_has_recurrent(model)) {
         // PR3: hybrid arch (qwen35, qwen35moe, qwen3next) is the only spec-decode
-        // path. The fork is metadata-only seq_cp + eager D2D recurrent-row copy.
-        // Pure recurrent (Mamba/RWKV) speculation is no longer scheduled here —
-        // the legacy llama_spec_ckpt_* path is gone (no-op stubs only) and that
-        // model family will fall back to non-speculative decode.
+        // path. Snapshot the per-seq KV state via ON_DEVICE so partial-reject
+        // restore is a single bulk D2D dispatch instead of seq_cp/seq_rm chain
+        // plus eager per-row qnext_copy_row at fork time. Pure recurrent (Mamba/
+        // RWKV) speculation is not scheduled here — the legacy llama_spec_ckpt_*
+        // path is gone and that model family falls back to non-spec decode.
         if (llama_model_is_hybrid(model)) {
-            const int n_parallel = params_base.n_parallel;
-
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
                     continue;
                 }
-                const bool ok = save_speculative_checkpoint_seq_cp(slot, model, ctx, n_parallel);
+                const bool ok = save_speculative_checkpoint_ondevice(slot, model, ctx);
                 if (ok) {
-                    SLT_DBG(slot, "spec checkpoint saved (mode=seq_cp), n_past_pre_spec=%d\n",
-                        slot.spec_ckpt.n_past);
+                    SLT_DBG(slot, "spec checkpoint saved (mode=on-device), n_past_pre_spec=%d, size=%zu\n",
+                        slot.spec_ckpt.n_past, slot.spec_ckpt.size());
                 } else {
-                    SLT_WRN(slot, "%s", "failed to save spec checkpoint\n");
+                    SLT_WRN(slot, "%s", "failed to save ON_DEVICE spec checkpoint\n");
                 }
             }
         }

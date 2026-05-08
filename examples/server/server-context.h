@@ -24,15 +24,19 @@ enum slot_command {
 
 struct server_speculative_checkpoint {
     bool valid = false;
-    // PR3: hybrid (qnext) is the only spec-decode path now. Pure recurrent
-    // (Mamba/RWKV) speculation is disabled (no_op stub for legacy API).
-    bool seq_cp_active = false;          // metadata-only seq_cp/seq_rm fork active
-    llama_seq_id draft_seq_id = -1;      // draft branch seq id (set when seq_cp_active)
-    llama_pos n_past = 0;
+    // PR3: ON_DEVICE snapshot replaces the seq_cp/seq_rm draft-branch fork.
+    // The actual KV state lives in ctx->mem_storage[slot.id]; `data` here is
+    // only the metadata payload (cell_count, per-cell positions, tensor sizes,
+    // io_magic header) needed to drive llama_state_seq_set_data on restore.
+    std::vector<uint8_t> data;
+    llama_pos pos_max = -1;              // pos_max captured at snapshot time
+    llama_pos n_past = 0;                // pre-spec n_past (== pos_max + 1)
     llama_token sampled = LLAMA_TOKEN_NULL;
     common_sampler * sampler = nullptr;  // saved sampler state
 
     void clear();
+
+    size_t size() const { return data.size(); }
 };
 
 struct server_slot {
