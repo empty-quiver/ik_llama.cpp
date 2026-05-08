@@ -4051,6 +4051,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 // Fallback for reserve-graph builds (no explicit seq info) and OOB seq_ids.
                 data[j] = 0;
             }
+            // src must be a valid row index into qnext state_storage. PR1 has cells[i].src == i,
+            // so this is trivially true. Asserts that PR2 cannot write an out-of-range src.
+            GGML_ASSERT((uint32_t) data[j] < llama_kv_qnext_state_slots(kv));
         }
     }
 

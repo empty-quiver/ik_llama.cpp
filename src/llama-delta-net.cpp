@@ -334,16 +334,21 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     // Writeback target: today's call sites pass `state_seq_id_local` == active seq_id, which IS the slot we own.
     ggml_tensor * state_dst = ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size, state_seq_id_local * state_row_size);
 
-    // Gather: read source state from cells[seq_id].src via inp_s_copy_row (resolved at set_inputs).
-    // PR1 invariant: cells[i].src == i, so this gathers the same row state_dst points at.
-    // PR2 will allow non-identity src to enable copy-on-write per-seq forking during speculation.
-    GGML_ASSERT(inp_s_copy_row != nullptr);
-    ggml_tensor * state_src_row = ggml_get_rows(ctx0, state_all, inp_s_copy_row);
-    cb(state_src_row, "state_src_row", il);
-    ggml_tensor * state_f32 = state_src_row;
-    if (state_f32->type != GGML_TYPE_F32) {
-        state_f32 = ggml_cast(ctx0, state_f32, GGML_TYPE_F32);
+    // Source state read.
+    //   PR1 (non-behavioral): inp_s_copy_row == nullptr, fall through to the original direct-slice
+    //                         ggml_view_2d path. Identical to pre-PR1 behavior; no extra op per layer.
+    //   PR2 (active path):    inp_s_copy_row != nullptr, gather row from cells[seq_id].src to enable
+    //                         copy-on-write per-seq forking during speculation.
+    ggml_tensor * state_src_row;
+    if (inp_s_copy_row != nullptr) {
+        state_src_row = ggml_get_rows(ctx0, state_all, inp_s_copy_row);
+        cb(state_src_row, "state_src_row", il);
+    } else {
+        state_src_row = ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size,
+                                     state_seq_id_local * state_row_size);
     }
+    // state_storage is F32-asserted above and ggml_get_rows emits F32, so state_src_row is always F32.
+    ggml_tensor * state_f32 = state_src_row;
     if (reset_state_local) {
         state_f32 = ggml_scale(ctx0, state_f32, 0.0f);
         cb(state_f32, "state_reset", il);
@@ -659,9 +664,9 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
-        // Single gather row for the whole batch — all tokens share the same seq_id, so any entry works.
-        ggml_tensor * inp_s_copy_row = ggml_view_1d(ctx0, lctx.inp_s_copy_qnext, 1, 0);
-        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_copy_qnext, inp_s_copy_row,
+        // PR1: pass nullptr for inp_s_copy_row so build_qkv falls back to direct ggml_view_2d slot indexing.
+        // PR2 will pass a real row tensor (e.g. ggml_view_1d on lctx.inp_s_copy_qnext) to enable the gather.
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_copy_qnext, /*inp_s_copy_row=*/nullptr,
                                             inp_out_ids, token_seq_ids.front(), reset_state, il, cb);
     }
 
@@ -671,12 +676,11 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     for (int64_t i = 0; i < batch.n_tokens; ++i) {
         ggml_tensor * cur_i = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (size_t) i * cur->nb[1]);
         ggml_tensor * inp_s_copy_qnext_i = ggml_view_2d(ctx0, lctx.inp_s_copy_qnext, 1, 1, lctx.inp_s_copy_qnext->nb[1], (size_t) i * lctx.inp_s_copy_qnext->nb[1]);
-        // Per-token gather row: one I32 element at the i-th slot.
-        ggml_tensor * inp_s_copy_row_i = ggml_view_1d(ctx0, lctx.inp_s_copy_qnext, 1, (size_t) i * sizeof(int32_t));
 
         const bool reset_state_i = batch.pos != nullptr && batch.pos[i] == 0;
         const uint32_t state_seq_id_i = (uint32_t) token_seq_ids[i];
-        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_copy_qnext_i, inp_s_copy_row_i,
+        // PR1: pass nullptr for inp_s_copy_row (see comment above).
+        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_copy_qnext_i, /*inp_s_copy_row=*/nullptr,
                                                            inp_out_ids, state_seq_id_i, reset_state_i, il, cb);
 
         out = out == nullptr ? out_i : ggml_concat(ctx0, out, out_i, 1);
