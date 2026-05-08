@@ -1679,6 +1679,18 @@ static bool llama_kv_cache_seq_rm(
         }
     }
 
+    // PR2: when a hybrid (qnext) seq is removed, collapse any pending COW chains that
+    // pointed at it. After this call the source's physical slot may no longer hold the
+    // expected state, so any other cell whose `.src == seq_id` must detach to its own
+    // identity row before the next gather runs.
+    if (has_qnext_state && seq_id >= 0 && (uint32_t) seq_id < cache.size) {
+        for (uint32_t k = 0; k < cache.size; ++k) {
+            if ((uint32_t) cache.cells[k].src == (uint32_t) seq_id && k != (uint32_t) seq_id) {
+                cache.cells[k].src = k;
+            }
+        }
+    }
+
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
 
@@ -1725,9 +1737,13 @@ static void llama_kv_cache_seq_cp(
         seq_id_src = cache.cells[seq_id_src].src;
         GGML_ASSERT((uint32_t) seq_id_src < cache.size);
 
-        cache.cells[seq_id_dst].src = seq_id_src;
+        // PR2: metadata-only fork. cells[dst].src points at the source slot so the
+        // in-graph ggml_get_rows gather (build_qkv) routes the recurrent read through
+        // the parent's physical state without a D2D state copy.
+        // Do NOT set cache.do_copy = true here: the eager s_copy graph is no longer
+        // needed for the qnext path — the per-layer gather handles routing.
+        cache.cells[seq_id_dst].src = (uint32_t) seq_id_src;
         cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
-        cache.do_copy = true;
     }
 
     // otherwise, this is the KV cache of a Transformer-like model
@@ -4038,7 +4054,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // Populate gather row index into qnext state_storage from cells[seq_id].src.
         // PR1 invariant: cells[i].src == i (steady state outside speculation), so this
         // is identity and the gather reads the same row the old direct view did.
-        // PR2 will allow non-identity src values to enable copy-on-write per-seq forking.
+        // PR2: seq_cp(slot.id, draft_seq) writes cells[draft_seq].src = slot.id, enabling
+        // the gather to route a forked seq's recurrent read through its parent's slot
+        // without a physical copy. Active seq id (verify decode) reads identity.
         auto & kv = lctx.kv_self;
         for (int64_t j = 0; j < n_tokens; ++j) {
             llama_seq_id seq_id = -1;
@@ -4051,8 +4069,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 // Fallback for reserve-graph builds (no explicit seq info) and OOB seq_ids.
                 data[j] = 0;
             }
-            // src must be a valid row index into qnext state_storage. PR1 has cells[i].src == i,
-            // so this is trivially true. Asserts that PR2 cannot write an out-of-range src.
+            // src must be a valid row index into qnext state_storage. PR1 has cells[i].src == i;
+            // PR2's seq_cp may set cells[seq_id].src to a different slot but it's still bounded.
             GGML_ASSERT((uint32_t) data[j] < llama_kv_qnext_state_slots(kv));
         }
     }

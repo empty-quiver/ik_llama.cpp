@@ -25,6 +25,8 @@ enum slot_command {
 struct server_speculative_checkpoint {
     bool valid = false;
     bool per_step_enabled = false; // per-step SSM checkpoints active
+    bool seq_cp_active = false; // PR2: hybrid path used metadata-only seq_cp/seq_rm fork
+    llama_seq_id draft_seq_id = -1; // PR2: draft branch seq id (set when seq_cp_active)
     llama_pos n_past = 0;
     llama_token sampled = LLAMA_TOKEN_NULL;
     common_sampler * sampler = nullptr; // saved sampler state

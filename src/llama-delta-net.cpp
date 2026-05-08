@@ -664,9 +664,10 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
-        // PR1: pass nullptr for inp_s_copy_row so build_qkv falls back to direct ggml_view_2d slot indexing.
-        // PR2 will pass a real row tensor (e.g. ggml_view_1d on lctx.inp_s_copy_qnext) to enable the gather.
-        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_copy_qnext, /*inp_s_copy_row=*/nullptr,
+        // PR2: activate the gather. inp_s_copy_qnext is I32 [1, n_tokens]; all_same_seq tokens
+        // share the same row index, so a 1-element view at offset 0 is sufficient.
+        ggml_tensor * inp_s_copy_row = ggml_view_1d(ctx0, lctx.inp_s_copy_qnext, 1, 0);
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_copy_qnext, inp_s_copy_row,
                                             inp_out_ids, token_seq_ids.front(), reset_state, il, cb);
     }
 
@@ -679,9 +680,12 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
         const bool reset_state_i = batch.pos != nullptr && batch.pos[i] == 0;
         const uint32_t state_seq_id_i = (uint32_t) token_seq_ids[i];
-        // PR1: pass nullptr for inp_s_copy_row (see comment above).
-        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_copy_qnext_i, /*inp_s_copy_row=*/nullptr,
-                                                           inp_out_ids, state_seq_id_i, reset_state_i, il, cb);
+        // PR2: activate the gather for the per-token (mixed-seq) path. Each token gets
+        // its own 1-element view into inp_s_copy_qnext at index i.
+        ggml_tensor * inp_s_copy_row_i = ggml_view_1d(ctx0, lctx.inp_s_copy_qnext, 1,
+                                                     (size_t) i * sizeof(int32_t));
+        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_copy_qnext_i, inp_s_copy_row_i,
+                                                          inp_out_ids, state_seq_id_i, reset_state_i, il, cb);
 
         out = out == nullptr ? out_i : ggml_concat(ctx0, out, out_i, 1);
     }

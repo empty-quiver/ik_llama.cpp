@@ -47,6 +47,8 @@ static void log_text(const gpt_params & params_base, const std::string & text) {
 void server_speculative_checkpoint::clear() {
     valid = false;
     per_step_enabled = false;
+    seq_cp_active = false;
+    draft_seq_id = -1;
     n_past = 0;
     sampled = LLAMA_TOKEN_NULL;
 
@@ -56,9 +58,54 @@ void server_speculative_checkpoint::clear() {
     }
 }
 
+// PR2: pick a draft seq_id that does not collide with user slots.
+// Layout: user slots use ids [0, n_parallel); draft branches live in
+// [n_parallel, 2*n_parallel) so slot.id and slot.id + n_parallel are paired.
+// n_seq_max is bumped to 2*n_parallel at load_model time when a drafter is
+// configured for a hybrid model (see load_model).
+static llama_seq_id pick_draft_seq_id(const server_slot & slot, int n_parallel) {
+    return (llama_seq_id) (slot.id + n_parallel);
+}
+
 static void discard_speculative_checkpoint(server_slot & slot, llama_context * ctx) {
+    if (slot.spec_ckpt.seq_cp_active && slot.spec_ckpt.draft_seq_id >= 0) {
+        // Drop the draft branch entirely (metadata-only).
+        llama_kv_cache_seq_rm(ctx, slot.spec_ckpt.draft_seq_id, -1, -1);
+    } else {
+        llama_spec_ckpt_discard(ctx);
+    }
     slot.spec_ckpt.clear();
-    llama_spec_ckpt_discard(ctx);
+}
+
+// Hybrid path: metadata-only fork via seq_cp. Returns true if the fork was set up.
+static bool save_speculative_checkpoint_seq_cp(server_slot & slot, llama_model * model,
+                                                llama_context * ctx, int n_parallel) {
+    slot.spec_ckpt.clear();
+    slot.spec_ckpt.n_past = slot.n_past - (int32_t)(slot.drafted.size() + 1);
+    slot.spec_ckpt.sampled = slot.sampled;
+    slot.spec_ckpt.seq_cp_active = true;
+    slot.spec_ckpt.draft_seq_id = pick_draft_seq_id(slot, n_parallel);
+
+    // Make sure no stale tokens are sitting in the draft branch (e.g. from a previous
+    // verify cycle that didn't clean up because the slot id was reused).
+    llama_kv_cache_seq_rm(ctx, slot.spec_ckpt.draft_seq_id, -1, -1);
+
+    // Fork the live slot into the draft branch. For hybrid (qnext) state this is
+    // metadata-only — cells[draft_seq_id].src is set to slot.id and the per-layer
+    // ggml_get_rows gather routes the recurrent read through the parent's slot.
+    // The transformer KV (full attention layers) still copies via seq_id sets.
+    llama_kv_cache_seq_cp(ctx, slot.id, slot.spec_ckpt.draft_seq_id, 0, slot.spec_ckpt.n_past);
+
+    slot.spec_ckpt.sampler = common_sampler_init(model, slot.sparams);
+    if (slot.spec_ckpt.sampler == nullptr) {
+        llama_kv_cache_seq_rm(ctx, slot.spec_ckpt.draft_seq_id, -1, -1);
+        slot.spec_ckpt.clear();
+        return false;
+    }
+    common_sampler_clone(slot.ctx_sampling, slot.spec_ckpt.sampler);
+
+    slot.spec_ckpt.valid = true;
+    return true;
 }
 
 static bool save_speculative_checkpoint(server_slot & slot, llama_model * model, llama_context * ctx, int ckpt_mode) {
@@ -130,7 +177,29 @@ server_context::~server_context() {
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
 
+    // PR2: ensure the target ctx has room for the draft-branch seq id when a drafter is
+    // configured. The seq_cp/seq_rm fork path picks draft seq id = slot.id + n_parallel,
+    // so the kv cache must support at least 2*n_parallel sequences. Both mparams.n_seq_max
+    // and cparams.n_seq_max derive from params.n_parallel in common.cpp, so we temporarily
+    // bump n_parallel for the duration of model+context construction, then restore it so
+    // the slot-creation loop in init() still produces the user-requested number of slots.
+    // Cost is one extra qnext state row per user slot (a few MB at most for 27B/IQ3_M).
+    const int saved_n_parallel = params_base.n_parallel;
+    const bool has_draft = !params_base.speculative.model.empty() ||
+                           !params_base.speculative.params.empty();
+    if (has_draft) {
+        const int requested = 2 * std::max(saved_n_parallel, 1);
+        if (params_base.n_parallel < requested) {
+            LOG_INFO("speculative: bumping n_seq_max to fit draft branch",
+                { {"prev", saved_n_parallel}, {"new", requested} });
+            params_base.n_parallel = requested;
+        }
+    }
+
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
+
+    // Restore so init() creates the user-requested number of slots, not 2x.
+    params_base.n_parallel = saved_n_parallel;
 
     model = llama_init.model;
     ctx = llama_init.context;
@@ -3844,6 +3913,81 @@ static void restore_speculative_checkpoint(
         server_slot & slot, llama_context * ctx, llama_model * model,
         const std::vector<llama_token> & ids, int n_draft,
         const std::vector<float> & mtp_hidden_state_pre, int32_t mtp_n_past_base) {
+    if (slot.spec_ckpt.seq_cp_active) {
+        // PR2: hybrid path. The pre-speculation state is preserved on the draft branch
+        // (the live slot received the draft tokens during verify decode). Truncate the
+        // draft branch to the accepted prefix and copy it back to the live slot.
+        // Both the forward seq_cp(draft -> slot) and the temporary trim are metadata-only
+        // for the qnext layers; the transformer KV cache rotates by seq_id sets which is
+        // also cheap. Then re-decode the accepted tokens to advance the recurrent state
+        // (the gather routes through cells[slot.id].src on each layer until the next
+        // explicit decode writes back to slot.id).
+        const int n_accepted = (int) ids.size();
+        const llama_pos n_past_pre = slot.spec_ckpt.n_past;
+        const llama_seq_id draft_seq = slot.spec_ckpt.draft_seq_id;
+
+        // Wipe everything in the live slot from n_past_pre forward — these are speculation
+        // tokens the verify decode wrote that we are about to re-do via the accepted path.
+        llama_kv_cache_seq_rm(ctx, slot.id, n_past_pre, -1);
+        // Restore the live slot from the saved branch (metadata-only for qnext).
+        llama_kv_cache_seq_cp(ctx, draft_seq, slot.id, 0, n_past_pre);
+        // Drop the draft branch.
+        llama_kv_cache_seq_rm(ctx, draft_seq, -1, -1);
+
+        if (slot.spec_ckpt.sampler) {
+            common_sampler_clone(slot.spec_ckpt.sampler, slot.ctx_sampling);
+        }
+
+        if (n_accepted > 0) {
+            // Re-decode the accepted tokens to advance the recurrent state of slot.id.
+            llama_batch re_batch = llama_batch_init(n_accepted, 0, 1);
+            common_batch_add(re_batch, slot.spec_ckpt.sampled, n_past_pre, { slot.id }, n_accepted == 1);
+            for (int j = 0; j < n_accepted - 1; j++) {
+                common_batch_add(re_batch, ids[j], n_past_pre + 1 + j, { slot.id }, j == n_accepted - 2);
+            }
+
+            if (slot.has_mtp) {
+                for (int j = 0; j < re_batch.n_tokens; j++) {
+                    re_batch.logits[j] = true;
+                }
+                llama_set_embeddings(ctx, true);
+            }
+
+            const int ret = llama_decode(ctx, re_batch);
+            if (ret != 0) {
+                SLT_ERR(slot, "failed to re-decode accepted tokens after seq_cp restore: %d\n", ret);
+            }
+            if (slot.has_mtp) {
+                const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+                slot.mtp_hidden_state.resize(n_accepted * n_embd);
+                for (int j = 0; j < n_accepted; j++) {
+                    const float * emb_j = llama_get_embeddings_ith(ctx, j);
+                    if (emb_j) {
+                        memcpy(slot.mtp_hidden_state.data() + j * n_embd, emb_j, n_embd * sizeof(float));
+                    }
+                }
+                llama_context * mtp_ctx_rej = common_speculative_get_mtp_ctx(slot.spec);
+                llama_context * mtp_target_rej = mtp_ctx_rej ? mtp_ctx_rej : ctx;
+                llama_set_draft_input_hidden_state(mtp_target_rej, slot.mtp_hidden_state.data());
+                mtp_accept_tokens(mtp_target_rej, ids, n_past_pre, slot.id);
+
+                if (n_accepted > 1) {
+                    memmove(slot.mtp_hidden_state.data(),
+                            slot.mtp_hidden_state.data() + (n_accepted - 1) * n_embd,
+                            n_embd * sizeof(float));
+                }
+                slot.mtp_hidden_state.resize(n_embd);
+            }
+            for (llama_token id : ids) {
+                common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+            }
+            llama_batch_free(re_batch);
+            SLT_DBG(slot, "seq_cp restore: re-decoded %d tokens (rejected %d drafts)\n",
+                n_accepted, (int)(n_draft - (ids.size() - 1)));
+        }
+        discard_speculative_checkpoint(slot, ctx);
+        return;
+    }
     if (slot.spec_ckpt.per_step_enabled) {
         const int step = (int)ids.size() - 1;
         llama_spec_ckpt_restore(ctx, slot.id, slot.spec_ckpt.n_past, step);
@@ -4611,13 +4755,23 @@ void server_context::update_slots() {
 
     if (llama_model_has_recurrent(model)) {
         const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
+        // PR2: hybrid arch (qwen35, qwen35moe, qwen3next) uses metadata-only seq_cp
+        // for fork instead of D2H/H2D snapshot. Pure recurrent (Mamba/RWKV) keeps
+        // the legacy llama_spec_ckpt_* path for now (PR3 will revisit).
+        const bool use_seq_cp = llama_model_is_hybrid(model);
+        const int n_parallel = params_base.n_parallel;
 
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
                 continue;
             }
-            if (save_speculative_checkpoint(slot, model, ctx, ckpt_mode)) {
-                const char * mode_name = slot.spec_ckpt.per_step_enabled ? "per-step" : "shadow/cpu";
+            bool ok = use_seq_cp
+                ? save_speculative_checkpoint_seq_cp(slot, model, ctx, n_parallel)
+                : save_speculative_checkpoint(slot, model, ctx, ckpt_mode);
+            if (ok) {
+                const char * mode_name =
+                    slot.spec_ckpt.seq_cp_active ? "seq_cp" :
+                    (slot.spec_ckpt.per_step_enabled ? "per-step" : "shadow/cpu");
                 SLT_DBG(slot, "spec checkpoint saved (mode=%s), n_past_pre_spec=%d\n",
                     mode_name, slot.spec_ckpt.n_past);
             } else {
