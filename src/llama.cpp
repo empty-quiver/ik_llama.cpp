@@ -7200,6 +7200,19 @@ struct llama_data_read {
     virtual size_t get_size_read() = 0;
     virtual ~llama_data_read() = default;
 
+    // Restore `size` bytes at `offset` of `tensor`. Default impl emulates the
+    // legacy host-bounce semantics: read `size` bytes from the input stream and
+    // dispatch ggml_backend_tensor_set into the live cache tensor. The
+    // ON_DEVICE override (llama_data_read_device) replaces this with a single
+    // bulk D2D copy from the per-seq mirror buffer staged at write time.
+    //
+    // PR2 covers the non-split attention paths only; recurrent (s_l) and
+    // graph-split (tensor->extra != nullptr) call sites continue to use
+    // read(size) + ggml_backend_tensor_set directly. PR3 will lift those.
+    virtual void read_tensor_data(struct ggml_tensor * tensor, size_t offset, size_t size, int /*il*/) {
+        ggml_backend_tensor_set(tensor, read(size), offset, size);
+    }
+
     void read_string(std::string & str) {
         uint32_t str_size;
         read_to(&str_size, sizeof(str_size));
@@ -7475,7 +7488,10 @@ struct llama_data_read {
                 if (kv_self.k_l[il]->extra) {
                     read_kv_cache_data_split(ctx, kv_self.k_l[il], read(cell_count * k_size_row), kv_self.head, k_size_row, cell_count, il);
                 } else {
-                    ggml_backend_tensor_set(kv_self.k_l[il], read(cell_count * k_size_row), kv_self.head * k_size_row, cell_count * k_size_row);
+                    // PR2: route non-split attn through the virtual so the ON_DEVICE
+                    // override can stage a bulk D2D copy. Default impl preserves
+                    // the legacy ggml_backend_tensor_set semantics.
+                    read_tensor_data(kv_self.k_l[il], kv_self.head * k_size_row, cell_count * k_size_row, il);
                 }
             }
         }
@@ -7522,7 +7538,8 @@ struct llama_data_read {
                     if (kv_self.v_l[il]->extra) {
                         read_kv_cache_data_split(ctx, kv_self.v_l[il], read(cell_count * v_size_row), kv_self.head, v_size_row, cell_count, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(cell_count * v_size_row), kv_self.head * v_size_row, cell_count * v_size_row);
+                        // PR2: route non-split attn V through the virtual.
+                        read_tensor_data(kv_self.v_l[il], kv_self.head * v_size_row, cell_count * v_size_row, il);
                     }
                 }
             }
@@ -7588,7 +7605,8 @@ struct llama_data_read {
                     // For each row in the transposed matrix, read the values for the whole cell range
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                         const size_t dst_offset = (kv_self.head + j * kv_self.size) * v_size_el;
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(cell_count * v_size_el), dst_offset, cell_count * v_size_el);
+                        // PR2: route transposed-V attn rows through the virtual for ON_DEVICE staging.
+                        read_tensor_data(kv_self.v_l[il], dst_offset, cell_count * v_size_el, il);
                     }
                 }
             }
@@ -7851,63 +7869,213 @@ struct llama_data_read_buffer : llama_data_read {
 };
 
 // =============================================================================
-// PR1 scaffolding: on-device save/load classes for LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
+// PR2: on-device save/load classes for LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
 //
-// The mainline llama.cpp project keeps a per-seq map of backend-resident snapshot
-// buffers (llama_context::mem_storage) so that llama_state_seq_get_data with the
-// ON_DEVICE flag can defer the H2D/D2H bounce: write_tensor records (tensor, ptr,
-// offset, size) tuples and the destructor performs a single
-// ggml_backend_tensor_copy from each cache tensor into a parallel
-// device-resident buffer (one per ggml_backend_buffer_type_t).
+// Mainline reference: src/llama-context.cpp (llama_io_write_device /
+// llama_io_read_device). We port the same staging-plan + bulk-dispatch shape
+// onto ik's `llama_data_write` / `llama_data_read` interface.
 //
-// This PR1 is the SCAFFOLDING piece. The classes below subclass the existing
-// host-bounce classes and PR1 leaves them behaviorally identical — the
-// llama_memory_buffers reference they hold is a touch point for the map slot but
-// nothing in PR1 inserts into it. PR2 replaces the bodies with the real
-// device-side staging (collect-then-bulk-copy) and PR3 wires the corresponding
-// fast-path readback / consolidation cleanups.
+// Write side (llama_data_write_device):
+//   - write_tensor_data() does NOT touch ptr/buf_size — it appends a
+//     (tensor, offset, size) record to `winfos` and advances size_written so
+//     the caller-side accounting matches the host-path layout.
+//   - The destructor partitions winfos by ggml_backend_buffer_type_t, builds
+//     a per-buft pair of (org view, cpy mirror) tensors via ggml_view_1d /
+//     ggml_new_tensor_1d, lazily allocates a backend buffer of total size
+//     from that buft (reusing if shape unchanged across snapshots of the same
+//     seq), and dispatches one ggml_backend_tensor_copy per record.
 //
-// Why this shape now: ik's llama_data_write already has a pure-virtual
-// write_tensor_data(tensor, offset, size, il), so the abstract base does not
-// need a new method (mainline has to add one). The only structural addition
-// here is the per-context mem_storage map (in llama-context.h) which the
-// destructors of the device classes can flush into in PR2.
+// Read side (llama_data_read_device):
+//   - read_tensor_data() matches each restore record back to the staged
+//     (org, cpy) pair captured at write time and dispatches a D2D copy
+//     cpy -> org. ptr/buf_size are NOT advanced for tensor bytes since the
+//     device write side never wrote tensor bytes into the host buffer.
+//
+// Recurrent-layer guard (PR2 scope): both classes detect recurrent layers
+// (hparams.recurrent_layer_arr[il]) and split tensors (tensor->extra) and
+// fall back to the inherited host-bounce path. PR3 will lift the recurrent
+// guard.
+//
+// Multi-buft support: mbufs is keyed by ggml_backend_buffer_type_t so when
+// attn KV is split across CUDA + CPU offload buffer types each gets its own
+// mirror tensor. This matches mainline's design.
 // =============================================================================
 
 struct llama_data_write_device : llama_data_write_buffer {
     llama_memory_buffers & mbufs;
 
+    struct write_info {
+        struct ggml_tensor * tensor;
+        size_t offset;
+        size_t size;
+    };
+    std::vector<write_info> winfos;
+
     llama_data_write_device(uint8_t * p, size_t len, const llama_model & _model, llama_memory_buffers & _mbufs)
         : llama_data_write_buffer(p, len, _model), mbufs(_mbufs) {
-        // PR1: no-op constructor body. PR2 will lazily allocate per-buft device
-        // staging tensors here / in the destructor.
-        (void)mbufs;  // silence unused warnings until PR2 starts using it
     }
 
-    // PR1 falls back to the host-bounce write_tensor_data inherited from
-    // llama_data_write_buffer. PR2 will override this to record (tensor, ptr,
-    // offset, size) tuples and flush them as ggml_backend_tensor_copy in the
-    // destructor.
-    //
-    // Note: split tensors (tensor->extra != nullptr) and the recurrent-layer
-    // aux-buffer path are intrinsically host-side — the device fast-path will
-    // detect those in PR2 and delegate to the inherited host implementation.
+    void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
+        // Recurrent layers and split-graph tensors stay on the host path.
+        // For recurrent layers (qnext s_l) the cache is small and indexed by
+        // seq_id row, so the host bounce is fine and PR3 will lift this.
+        if (tensor->extra || (il >= 0 && size_t(il) < model.hparams.recurrent_layer_arr.size()
+                              && model.hparams.recurrent_layer_arr[il])) {
+            llama_data_write_buffer::write_tensor_data(tensor, offset, size, il);
+            return;
+        }
+
+        // Non-split attention path: defer the actual D2D copy to the destructor.
+        // We DON'T advance ptr / consume buf_size here — the on-device snapshot
+        // buffer never holds the tensor bytes. We only bump size_written so
+        // get_size_written() reflects the logical (host-equivalent) snapshot
+        // size; the ON_DEVICE caller's `size` argument is sized for the legacy
+        // host layout.
+        winfos.push_back({const_cast<ggml_tensor *>(tensor), offset, size});
+        size_written += size;
+    }
+
+    ~llama_data_write_device() {
+        if (winfos.empty()) {
+            return;
+        }
+
+        // Group records by buffer type and build per-buft mirror contexts.
+        llama_memory_buffers mbufs_new;
+
+        for (const auto & winfo : winfos) {
+            auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
+            mbufs_new[buft].n_tensors++;
+            mbufs_new[buft].total_size += winfo.size;
+        }
+
+        for (auto & kv : mbufs_new) {
+            auto & mbuf = kv.second;
+            ggml_init_params params = {
+                /*.mem_size   =*/ 2 * size_t(mbuf.n_tensors) * ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            mbuf.ctx.reset(ggml_init(params));
+            mbuf.org.reserve(mbuf.n_tensors);
+            mbuf.cpy.reserve(mbuf.n_tensors);
+        }
+
+        for (const auto & winfo : winfos) {
+            auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
+            auto & mbuf = mbufs_new[buft];
+
+            const int64_t n = winfo.size / ggml_element_size(winfo.tensor);
+
+            // org: a 1-D view of the live cache tensor at the (offset, size) range.
+            // cpy: a 1-D mirror tensor of the same type+length, allocated from buft.
+            mbuf.org.push_back(ggml_view_1d      (mbuf.ctx.get(), winfo.tensor, n, winfo.offset));
+            mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
+        }
+
+        for (auto & kv : mbufs_new) {
+            auto * buft = kv.first;
+            auto & mbuf = kv.second;
+
+            auto & mbuf_cur = mbufs[buft];
+
+            // Reuse cached buffer if shape matches; otherwise reallocate.
+            if (!mbuf_cur.buf
+                || mbuf_cur.org.size() != mbuf.org.size()
+                || mbuf_cur.total_size != mbuf.total_size) {
+                mbuf_cur = std::move(mbuf);
+                mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+                LLAMA_LOG_INFO("%s: allocated '%s' on-device snapshot buffer %.3f MiB\n",
+                        __func__, ggml_backend_buft_name(buft),
+                        mbuf_cur.total_size / 1024.0 / 1024.0);
+            }
+
+            // Bulk dispatch: one copy per record. Same-backend = D2D fast path.
+            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+            }
+        }
+    }
 };
 
 struct llama_data_read_device : llama_data_read_buffer {
     const llama_memory_buffers & mbufs;
+    const struct llama_model & model;
 
-    llama_data_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & _mbufs)
-        : llama_data_read_buffer(p, len), mbufs(_mbufs) {
-        // PR1: no-op constructor body. PR2 will validate that the per-buft
-        // staging tensors here match the layout written by the prior
-        // llama_data_write_device for this seq_id.
-        (void)mbufs;
+    struct read_info {
+        struct ggml_tensor * tensor;
+        size_t offset;
+        size_t size;
+    };
+    std::vector<read_info> rinfos;
+
+    llama_data_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & _mbufs, const llama_model & _model)
+        : llama_data_read_buffer(p, len), mbufs(_mbufs), model(_model) {
     }
 
-    // PR1 inherits read / read_to verbatim. PR2 will override read_tensor_data
-    // (added then) to perform a single ggml_backend_tensor_copy from the
-    // pre-staged device buffer into the live cache tensor.
+    void read_tensor_data(struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
+        // Same guards as the write side: split / recurrent stays on host path.
+        if (tensor->extra || (il >= 0 && size_t(il) < model.hparams.recurrent_layer_arr.size()
+                              && model.hparams.recurrent_layer_arr[il])) {
+            llama_data_read::read_tensor_data(tensor, offset, size, il);
+            return;
+        }
+
+        // Defer the D2D copy to the destructor so we can validate buft layout
+        // against the staged mbufs once and dispatch in bulk.
+        rinfos.push_back({tensor, offset, size});
+    }
+
+    ~llama_data_read_device() {
+        if (rinfos.empty()) {
+            return;
+        }
+
+        // Recompute per-buft tallies and validate against the staged mbufs.
+        llama_memory_buffers mbufs_new;
+        for (const auto & rinfo : rinfos) {
+            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+            mbufs_new[buft].n_tensors++;
+            mbufs_new[buft].total_size += rinfo.size;
+        }
+
+        for (auto & kv : mbufs_new) {
+            auto * buft = kv.first;
+            auto & mbuf = kv.second;
+            auto it = mbufs.find(buft);
+            if (it == mbufs.end() || !it->second.buf
+                || size_t(it->second.n_tensors) != size_t(mbuf.n_tensors)
+                || it->second.total_size != mbuf.total_size) {
+                LLAMA_LOG_ERROR("%s: on-device snapshot mbuf mismatch for buft '%s' (have %d tensors / %zu bytes, want %d / %zu)\n",
+                        __func__,
+                        ggml_backend_buft_name(buft),
+                        it == mbufs.end() ? -1 : it->second.n_tensors,
+                        it == mbufs.end() ? size_t(0) : it->second.total_size,
+                        mbuf.n_tensors,
+                        mbuf.total_size);
+                return;
+            }
+        }
+
+        // Walk rinfos in record order, matching the ordering used at write time.
+        // mbufs[buft].org[i] / .cpy[i] were inserted in winfo order; replicate
+        // that ordering by counting per-buft index.
+        std::map<ggml_backend_buffer_type_t, size_t> buft_idx;
+        for (const auto & rinfo : rinfos) {
+            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+            const auto & mbuf_cur = mbufs.at(buft);
+            size_t i = buft_idx[buft]++;
+
+            // Sanity-check that the staged view matches this restore record.
+            if (i >= mbuf_cur.cpy.size() || i >= mbuf_cur.org.size()) {
+                LLAMA_LOG_ERROR("%s: on-device snapshot index OOB on buft '%s'\n",
+                        __func__, ggml_backend_buft_name(buft));
+                return;
+            }
+            // D2D copy from the staged mirror back into the live cache view.
+            ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf_cur.org[i]);
+        }
+    }
 };
 
 struct llama_data_write_file : llama_data_write {
@@ -8141,12 +8309,14 @@ size_t llama_state_seq_get_size(struct llama_context * ctx, llama_seq_id seq_id,
     return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
 }
 
+// PR2: io_magic preamble for ON_DEVICE snapshots. Mainline reference:
+// src/llama-context.cpp constexpr uint32_t io_magic = 0xaf143cd8. We emit
+// the magic + seq_id only when the ON_DEVICE flag is set so the legacy
+// host-bounce binary layout (flags=0) stays byte-identical for existing
+// callers (including the state_seq_save_file path which uses flags=0).
+static constexpr uint32_t llama_state_seq_io_magic = 0xaf143cd8;
+
 size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // PR1 dispatch: when LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is set, route through
-    // llama_data_write_device. In PR1 the device class subclasses the host
-    // buffer class and behaves identically; the only observable difference is
-    // that mem_storage[seq_id] is touched (creating an empty entry if it did
-    // not exist). PR2 will give the device class real device-staging behavior.
     std::unique_ptr<llama_data_write> data_ctx;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         data_ctx = std::unique_ptr<llama_data_write>(
@@ -8156,6 +8326,10 @@ size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_
             new llama_data_write_buffer(dst, size, ctx->model));
     }
     try {
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            data_ctx->write(&llama_state_seq_io_magic, sizeof(llama_state_seq_io_magic));
+            data_ctx->write(&seq_id, sizeof(seq_id));
+        }
         return llama_state_seq_get_data_internal(ctx, *data_ctx, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state: %s\n", __func__, err.what());
@@ -8172,25 +8346,50 @@ static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llam
 }
 
 size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags) {
-    // PR1 dispatch (mirrors llama_state_seq_get_data above). For ON_DEVICE the
-    // mainline reference reads a small magic+seq_id header to look up the
-    // matching mem_storage slot before constructing the read context. In PR1
-    // the device class is layout-compatible with the buffer class so we can
-    // skip that pre-read and let the inner state_seq_read_data run as usual.
-    // PR2 will reintroduce the magic/header check once write_device actually
-    // diverges from the buffer layout.
+    // PR2: when ON_DEVICE is set, peek the magic+seq_id header to (a) reject
+    // mismatched payloads early and (b) look up the matching mem_storage slot.
+    // For flags=0 (legacy host bounce) we don't expect a magic in the payload.
+    llama_seq_id src_seq_id = dest_seq_id;
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        llama_data_read_buffer probe(src, size);
+        try {
+            uint32_t magic_read = 0;
+            probe.read_to(&magic_read, sizeof(magic_read));
+            if (magic_read != llama_state_seq_io_magic) {
+                LLAMA_LOG_ERROR("%s: wrong on-device sequence state magic: got 0x%08x want 0x%08x\n",
+                        __func__, magic_read, llama_state_seq_io_magic);
+                return 0;
+            }
+            probe.read_to(&src_seq_id, sizeof(src_seq_id));
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error reading on-device sequence header: %s\n", __func__, err.what());
+            return 0;
+        }
+        // The mem_storage slot is keyed by the SOURCE seq_id used at write time.
+        if (ctx->mem_storage.find(src_seq_id) == ctx->mem_storage.end()) {
+            LLAMA_LOG_ERROR("%s: no on-device snapshot for seq_id %d\n", __func__, src_seq_id);
+            return 0;
+        }
+    }
+
     std::unique_ptr<llama_data_read> data_ctx;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // GUARD: with ON_DEVICE, fall back gracefully if the seq's mem_storage
-        // entry is missing (PR2 will populate it on the matching write side).
-        // For PR1 the entry is always empty, so we just use the empty slot.
         data_ctx = std::unique_ptr<llama_data_read>(
-            new llama_data_read_device(src, size, ctx->mem_storage[dest_seq_id]));
+            new llama_data_read_device(src, size, ctx->mem_storage[src_seq_id], ctx->model));
     } else {
         data_ctx = std::unique_ptr<llama_data_read>(
             new llama_data_read_buffer(src, size));
     }
     try {
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // Consume the magic+seq_id we already validated so the inner reader
+            // starts at the meta header, identical to the legacy layout.
+            uint32_t magic_read = 0;
+            data_ctx->read_to(&magic_read, sizeof(magic_read));
+            llama_seq_id seq_read = 0;
+            data_ctx->read_to(&seq_read, sizeof(seq_read));
+            (void)magic_read; (void)seq_read; // already validated above
+        }
         return llama_state_seq_set_data_internal(ctx, *data_ctx, dest_seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what());
