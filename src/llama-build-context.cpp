@@ -108,7 +108,7 @@ void llm_build_context::init() {
     lctx.inp_s_copy      = nullptr;
     lctx.inp_s_mask      = nullptr;
     lctx.inp_s_seq       = nullptr;
-    lctx.inp_s_seq_qnext = nullptr;
+    lctx.inp_s_copy_qnext = nullptr;
     lctx.inp_pos_bucket    = nullptr;
     lctx.inp_embd_enc      = nullptr;
     lctx.inp_KQ_mask_cross = nullptr;

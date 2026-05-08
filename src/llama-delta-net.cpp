@@ -303,7 +303,8 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_beta_gate(llama_context
 }
 
 ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_storage, ggml_tensor * ssm_conv1d,
-        ggml_tensor * qkv_mixed, ggml_tensor * inp_s_seq_qnext, ggml_tensor * beta, ggml_tensor * gate,
+        ggml_tensor * qkv_mixed, ggml_tensor * inp_s_copy_qnext, ggml_tensor * inp_s_copy_row,
+        ggml_tensor * beta, ggml_tensor * gate,
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
         float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
@@ -330,8 +331,16 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
 
     state_all = ggml_view_2d(ctx0, state_storage, state_dim, qnext_state_slots, state_row_size, 0);
 
+    // Writeback target: today's call sites pass `state_seq_id_local` == active seq_id, which IS the slot we own.
     ggml_tensor * state_dst = ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size, state_seq_id_local * state_row_size);
-    ggml_tensor * state_f32 = state_dst;
+
+    // Gather: read source state from cells[seq_id].src via inp_s_copy_row (resolved at set_inputs).
+    // PR1 invariant: cells[i].src == i, so this gathers the same row state_dst points at.
+    // PR2 will allow non-identity src to enable copy-on-write per-seq forking during speculation.
+    GGML_ASSERT(inp_s_copy_row != nullptr);
+    ggml_tensor * state_src_row = ggml_get_rows(ctx0, state_all, inp_s_copy_row);
+    cb(state_src_row, "state_src_row", il);
+    ggml_tensor * state_f32 = state_src_row;
     if (state_f32->type != GGML_TYPE_F32) {
         state_f32 = ggml_cast(ctx0, state_f32, GGML_TYPE_F32);
     }
@@ -350,7 +359,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(state, "state_predelta", il);
     ggml_build_forward_expand(gf, state);
 
-    ggml_tensor * conv_output_raw = ggml_ssm_conv(ctx0, conv_states, qkv_mixed, ssm_conv1d, inp_s_seq_qnext);
+    ggml_tensor * conv_output_raw = ggml_ssm_conv(ctx0, conv_states, qkv_mixed, ssm_conv1d, inp_s_copy_qnext);
     cb(conv_output_raw, "conv_output_raw", il);
 
     ggml_tensor * conv_output = ggml_view_2d(ctx0, conv_output_raw, conv_dim, n_tok, conv_dim * ggml_element_size(conv_output_raw), 0);
@@ -455,7 +464,8 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
 }
 
 ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
-            ggml_tensor * delta_input, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
+            ggml_tensor * delta_input, ggml_tensor * inp_s_copy_qnext, ggml_tensor * inp_s_copy_row,
+            ggml_tensor * inp_out_ids,
             uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb) const {
 
     const int64_t n_tok = delta_input->ne[1];
@@ -540,7 +550,8 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             }
             auto split_ssm_conv1d = (ggml_split_tensor_t *)l.ssm_conv1d->extra;
             GGML_ASSERT(split_ssm_conv1d && split_ssm_conv1d->splits[id]);
-            auto output = build_qkv(ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id], qkv_mixed, inp_s_seq_qnext, beta, gate,
+            auto output = build_qkv(ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id],
+                               qkv_mixed, inp_s_copy_qnext, inp_s_copy_row, beta, gate,
                                head_k_dim, num_k_heads_id, head_v_dim, num_v_heads_id, hparams.ssm_d_conv,
                                state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
                                l.ssm_beta_alpha ? 0 : 1, il, cb, gf);
@@ -611,7 +622,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     }
 
     auto output = build_qkv(ctx0, kv_self.s_l[il], model.layers[il].ssm_conv1d,
-        qkv_mixed, inp_s_seq_qnext, beta, gate,
+        qkv_mixed, inp_s_copy_qnext, inp_s_copy_row, beta, gate,
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf,
@@ -631,7 +642,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 
 ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const {
-    GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
+    GGML_ASSERT(lctx.inp_s_copy_qnext != nullptr);
 
     auto & model = lctx.model;
     auto & hparams = model.hparams;
@@ -648,7 +659,10 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
-        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb);
+        // Single gather row for the whole batch — all tokens share the same seq_id, so any entry works.
+        ggml_tensor * inp_s_copy_row = ggml_view_1d(ctx0, lctx.inp_s_copy_qnext, 1, 0);
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_copy_qnext, inp_s_copy_row,
+                                            inp_out_ids, token_seq_ids.front(), reset_state, il, cb);
     }
 
     GGML_ASSERT(has_unique_seq_ids && "qwen3next mixed-sequence batches require unique sequence IDs per token");
@@ -656,11 +670,14 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     ggml_tensor * out = nullptr;
     for (int64_t i = 0; i < batch.n_tokens; ++i) {
         ggml_tensor * cur_i = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (size_t) i * cur->nb[1]);
-        ggml_tensor * inp_s_seq_qnext_i = ggml_view_2d(ctx0, lctx.inp_s_seq_qnext, 1, 1, lctx.inp_s_seq_qnext->nb[1], (size_t) i * lctx.inp_s_seq_qnext->nb[1]);
+        ggml_tensor * inp_s_copy_qnext_i = ggml_view_2d(ctx0, lctx.inp_s_copy_qnext, 1, 1, lctx.inp_s_copy_qnext->nb[1], (size_t) i * lctx.inp_s_copy_qnext->nb[1]);
+        // Per-token gather row: one I32 element at the i-th slot.
+        ggml_tensor * inp_s_copy_row_i = ggml_view_1d(ctx0, lctx.inp_s_copy_qnext, 1, (size_t) i * sizeof(int32_t));
 
         const bool reset_state_i = batch.pos != nullptr && batch.pos[i] == 0;
         const uint32_t state_seq_id_i = (uint32_t) token_seq_ids[i];
-        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_seq_qnext_i, inp_out_ids, state_seq_id_i, reset_state_i, il, cb);
+        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_copy_qnext_i, inp_s_copy_row_i,
+                                                           inp_out_ids, state_seq_id_i, reset_state_i, il, cb);
 
         out = out == nullptr ? out_i : ggml_concat(ctx0, out, out_i, 1);
     }

@@ -4029,15 +4029,28 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
-    if (lctx.inp_s_seq_qnext) {
+    if (lctx.inp_s_copy_qnext) {
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_qnext->buffer));
-        int32_t * data = (int32_t *) lctx.inp_s_seq_qnext->data;
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_copy_qnext->buffer));
+        int32_t * data = (int32_t *) lctx.inp_s_copy_qnext->data;
 
+        // Populate gather row index into qnext state_storage from cells[seq_id].src.
+        // PR1 invariant: cells[i].src == i (steady state outside speculation), so this
+        // is identity and the gather reads the same row the old direct view did.
+        // PR2 will allow non-identity src values to enable copy-on-write per-seq forking.
+        auto & kv = lctx.kv_self;
         for (int64_t j = 0; j < n_tokens; ++j) {
-            // qwen3next linear-attention path uses a single local recurrent state slot.
-            data[j] = 0;
+            llama_seq_id seq_id = -1;
+            if (batch.seq_id != nullptr && batch.n_seq_id != nullptr && batch.n_seq_id[j] > 0) {
+                seq_id = batch.seq_id[j][0];
+            }
+            if (llama_kv_qnext_seq_id_in_range(kv, seq_id) && (uint32_t) seq_id < kv.size) {
+                data[j] = (int32_t) kv.cells[seq_id].src;
+            } else {
+                // Fallback for reserve-graph builds (no explicit seq info) and OOB seq_ids.
+                data[j] = 0;
+            }
         }
     }
 
