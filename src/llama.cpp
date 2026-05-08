@@ -7711,6 +7711,11 @@ struct llama_data_read {
 
 struct llama_data_write_dummy : llama_data_write {
     size_t size_written = 0;
+    // PR3: when probing ON_DEVICE size, the host buffer never holds the
+    // tensor bytes — they live in the per-seq mem_storage device mirror.
+    // Skip them here so callers don't allocate a 100+ MiB host buffer for
+    // a snapshot whose host-side payload is only a few KiB of meta.
+    bool count_tensor_data = true;
 
     llama_data_write_dummy() {}
 
@@ -7719,7 +7724,9 @@ struct llama_data_write_dummy : llama_data_write {
     }
 
     void write_tensor_data(const struct ggml_tensor * /* tensor */, size_t /* offset */, size_t size, int /* il */) override {
-        size_written += size;
+        if (count_tensor_data) {
+            size_written += size;
+        }
     }
 
     size_t get_size_written() override {
@@ -7911,6 +7918,7 @@ struct llama_data_read_buffer : llama_data_read {
 
 struct llama_data_write_device : llama_data_write_buffer {
     llama_memory_buffers & mbufs;
+    ggml_backend_sched_t sched;
 
     struct write_info {
         struct ggml_tensor * tensor;
@@ -7919,8 +7927,8 @@ struct llama_data_write_device : llama_data_write_buffer {
     };
     std::vector<write_info> winfos;
 
-    llama_data_write_device(uint8_t * p, size_t len, const llama_model & _model, llama_memory_buffers & _mbufs)
-        : llama_data_write_buffer(p, len, _model), mbufs(_mbufs) {
+    llama_data_write_device(uint8_t * p, size_t len, const llama_model & _model, llama_memory_buffers & _mbufs, ggml_backend_sched_t _sched)
+        : llama_data_write_buffer(p, len, _model), mbufs(_mbufs), sched(_sched) {
     }
 
     void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
@@ -7934,13 +7942,15 @@ struct llama_data_write_device : llama_data_write_buffer {
         }
 
         // Non-split path: defer the actual D2D copy to the destructor.
-        // We DON'T advance ptr / consume buf_size here — the on-device snapshot
-        // buffer never holds the tensor bytes. We only bump size_written so
-        // get_size_written() reflects the logical (host-equivalent) snapshot
-        // size; the ON_DEVICE caller's `size` argument is sized for the legacy
-        // host layout.
+        // We DON'T advance ptr / consume buf_size, AND we don't bump
+        // size_written — the on-device snapshot buffer never holds the
+        // tensor bytes (they're staged in mem_storage), so reflecting them
+        // in the returned size would force callers to over-allocate by the
+        // full recurrent-state size (100+ MiB on big hybrid models). The
+        // matching dummy (llama_data_write_dummy with count_tensor_data=false)
+        // returns the same small size from llama_state_seq_get_size so the
+        // round-trip alloc / get_size / get_data accounting stays consistent.
         winfos.push_back({const_cast<ggml_tensor *>(tensor), offset, size});
-        size_written += size;
     }
 
     ~llama_data_write_device() {
@@ -7977,9 +7987,45 @@ struct llama_data_write_device : llama_data_write_buffer {
 
             // org: a 1-D view of the live cache tensor at the (offset, size) range.
             // cpy: a 1-D mirror tensor of the same type+length, allocated from buft.
-            mbuf.org.push_back(ggml_view_1d      (mbuf.ctx.get(), winfo.tensor, n, winfo.offset));
-            mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
+            ggml_tensor * org = ggml_view_1d      (mbuf.ctx.get(), winfo.tensor, n, winfo.offset);
+            ggml_tensor * cpy = ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n);
+            // Patch org->buffer so the CUDA cpy_tensor_async path recognizes it
+            // as device-resident (ggml views default to NULL buffer and route
+            // through view_src->buffer, but the CUDA async checker hits
+            // src->buffer directly and would refuse the async path otherwise).
+            // cpy is freshly allocated and already has its own buffer set after
+            // ggml_backend_alloc_ctx_tensors_from_buft below.
+            ggml_backend_buffer_t live_buf =
+                winfo.tensor->view_src ? winfo.tensor->view_src->buffer : winfo.tensor->buffer;
+            org->buffer = live_buf;
+            mbuf.org.push_back(org);
+            mbuf.cpy.push_back(cpy);
         }
+
+        // PR3: dispatch all copies via the async path (cudaMemcpyAsync on CUDA)
+        // and synchronize the backend ONCE at the end. The sync per-tensor_copy
+        // path was costing ~60ms per save on Qwen3.5-MoE because every CUDA
+        // tensor_copy forced cudaStreamSynchronize, serializing the 16 small
+        // per-layer copies. With one trailing sync we get D2D throughput close
+        // to peak intra-device bandwidth.
+        std::vector<ggml_backend_t> async_backends;
+        async_backends.reserve(4);
+        auto note_backend = [&](ggml_backend_t b) {
+            if (b == nullptr) return;
+            for (auto * x : async_backends) if (x == b) return;
+            async_backends.push_back(b);
+        };
+        auto resolve_backend = [&](ggml_backend_buffer_type_t buft) -> ggml_backend_t {
+            if (sched == nullptr || buft == nullptr) return nullptr;
+            const int n_backends = ggml_backend_sched_get_n_backends(sched);
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                if (b != nullptr && ggml_backend_supports_buft(b, buft)) {
+                    return b;
+                }
+            }
+            return nullptr;
+        };
 
         for (auto & kv : mbufs_new) {
             auto * buft = kv.first;
@@ -7998,10 +8044,22 @@ struct llama_data_write_device : llama_data_write_buffer {
                         mbuf_cur.total_size / 1024.0 / 1024.0);
             }
 
-            // Bulk dispatch: one copy per record. Same-backend = D2D fast path.
+            ggml_backend_t b = resolve_backend(buft);
+            // Bulk dispatch via async copy (single trailing sync below).
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                if (b != nullptr) {
+                    ggml_backend_tensor_copy_async(b, b, mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                    note_backend(b);
+                } else {
+                    ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                }
             }
+        }
+
+        // ONE sync per backend that received async work. Drains all the queued
+        // D2D copies before write_kv_cache returns.
+        for (auto * b : async_backends) {
+            ggml_backend_synchronize(b);
         }
     }
 };
@@ -8009,6 +8067,7 @@ struct llama_data_write_device : llama_data_write_buffer {
 struct llama_data_read_device : llama_data_read_buffer {
     const llama_memory_buffers & mbufs;
     const struct llama_model & model;
+    ggml_backend_sched_t sched;
 
     struct read_info {
         struct ggml_tensor * tensor;
@@ -8017,8 +8076,8 @@ struct llama_data_read_device : llama_data_read_buffer {
     };
     std::vector<read_info> rinfos;
 
-    llama_data_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & _mbufs, const llama_model & _model)
-        : llama_data_read_buffer(p, len), mbufs(_mbufs), model(_model) {
+    llama_data_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & _mbufs, const llama_model & _model, ggml_backend_sched_t _sched)
+        : llama_data_read_buffer(p, len), mbufs(_mbufs), model(_model), sched(_sched) {
     }
 
     void read_tensor_data(struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
@@ -8069,6 +8128,27 @@ struct llama_data_read_device : llama_data_read_buffer {
             }
         }
 
+        // PR3: same async + single trailing sync pattern as the write side.
+        // Per-tensor sync was costing ~60ms per restore on Qwen3.5-MoE.
+        std::vector<ggml_backend_t> async_backends;
+        async_backends.reserve(4);
+        auto note_backend = [&](ggml_backend_t b) {
+            if (b == nullptr) return;
+            for (auto * x : async_backends) if (x == b) return;
+            async_backends.push_back(b);
+        };
+        auto resolve_backend = [&](ggml_backend_buffer_type_t buft) -> ggml_backend_t {
+            if (sched == nullptr || buft == nullptr) return nullptr;
+            const int n_backends = ggml_backend_sched_get_n_backends(sched);
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                if (b != nullptr && ggml_backend_supports_buft(b, buft)) {
+                    return b;
+                }
+            }
+            return nullptr;
+        };
+
         // Walk rinfos in record order, matching the ordering used at write time.
         // mbufs[buft].org[i] / .cpy[i] were inserted in winfo order; replicate
         // that ordering by counting per-buft index.
@@ -8085,8 +8165,17 @@ struct llama_data_read_device : llama_data_read_buffer {
                 ondevice_failed = true;
                 return;
             }
-            // D2D copy from the staged mirror back into the live cache view.
-            ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf_cur.org[i]);
+            ggml_backend_t b = resolve_backend(buft);
+            if (b != nullptr) {
+                ggml_backend_tensor_copy_async(b, b, mbuf_cur.cpy[i], mbuf_cur.org[i]);
+                note_backend(b);
+            } else {
+                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf_cur.org[i]);
+            }
+        }
+
+        for (auto * b : async_backends) {
+            ggml_backend_synchronize(b);
         }
     }
 };
@@ -8319,7 +8408,20 @@ static size_t llama_state_seq_get_data_internal(struct llama_context * ctx, llam
 
 size_t llama_state_seq_get_size(struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_data_write_dummy data_ctx;
-    return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
+    // PR3: for ON_DEVICE, the actual tensor bytes never hit the host buffer —
+    // they're staged in ctx->mem_storage[seq_id] via D2D copy. The host buffer
+    // only carries the magic+seq_id header, the cell-meta and the per-layer
+    // structural records. Skip tensor data accounting in the dummy so the
+    // caller allocates only the few KiB it actually uses, not the full
+    // recurrent-state size (which can be 100+ MiB on Qwen3.5-MoE).
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        data_ctx.count_tensor_data = false;
+    }
+    size_t n = llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        n += sizeof(uint32_t) + sizeof(llama_seq_id);
+    }
+    return n;
 }
 
 // PR2: io_magic preamble for ON_DEVICE snapshots. Mainline reference:
@@ -8333,7 +8435,7 @@ size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_
     std::unique_ptr<llama_data_write> data_ctx;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         data_ctx = std::unique_ptr<llama_data_write>(
-            new llama_data_write_device(dst, size, ctx->model, ctx->mem_storage[seq_id]));
+            new llama_data_write_device(dst, size, ctx->model, ctx->mem_storage[seq_id], ctx->sched));
     } else {
         data_ctx = std::unique_ptr<llama_data_write>(
             new llama_data_write_buffer(dst, size, ctx->model));
@@ -8388,7 +8490,7 @@ size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src,
     std::unique_ptr<llama_data_read> data_ctx;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         data_ctx = std::unique_ptr<llama_data_read>(
-            new llama_data_read_device(src, size, ctx->mem_storage[src_seq_id], ctx->model));
+            new llama_data_read_device(src, size, ctx->mem_storage[src_seq_id], ctx->model, ctx->sched));
     } else {
         data_ctx = std::unique_ptr<llama_data_read>(
             new llama_data_read_buffer(src, size));
