@@ -71,13 +71,20 @@ static bool common_speculative_are_compatible(
         return false;
     }
 
-    if (
-        llama_vocab_get_add_bos(vocab_tgt) != llama_vocab_get_add_bos(vocab_dft) ||
-        llama_vocab_get_add_eos(vocab_tgt) != llama_vocab_get_add_eos(vocab_dft) ||
-        llama_vocab_bos(vocab_tgt) != llama_vocab_bos(vocab_dft) ||
-        llama_vocab_eos(vocab_tgt) != llama_vocab_eos(vocab_dft)
-    ) {
-        LOG_DBG("%s: draft model special tokens must match target model to use speculation\n", __func__);
+    if (llama_vocab_get_add_bos(vocab_tgt) != llama_vocab_get_add_bos(vocab_dft) ||
+        (llama_vocab_get_add_bos(vocab_tgt) && llama_vocab_bos(vocab_tgt) != llama_vocab_bos(vocab_dft))) {
+        LOG_WRN("%s: draft model bos tokens must match target model to use speculation. add: %d - %d, id: %d - %d)\n",
+                __func__,
+                llama_vocab_get_add_bos(vocab_tgt), llama_vocab_get_add_bos(vocab_dft),
+                llama_vocab_bos(vocab_tgt), llama_vocab_bos(vocab_dft));
+        return false;
+    }
+    if (llama_vocab_get_add_eos(vocab_tgt) != llama_vocab_get_add_eos(vocab_dft) ||
+        (llama_vocab_get_add_eos(vocab_tgt) && llama_vocab_eos(vocab_tgt) != llama_vocab_eos(vocab_dft))) {
+        LOG_WRN("%s: draft model eos tokens must match target model to use speculation. add: %d - %d, id: %d - %d)\n",
+                __func__,
+                llama_vocab_get_add_eos(vocab_tgt), llama_vocab_get_add_eos(vocab_dft),
+                llama_vocab_eos(vocab_tgt), llama_vocab_eos(vocab_dft));
         return false;
     }
 
@@ -429,14 +436,25 @@ struct common_speculative_state_draft : public common_speculative_state {
 
             common_sampler_accept(smpl, nullptr, id, true);
 
-            result.push_back(id);
+            // Bug A fix: ik llama_sample_dist runs softmax with normalize=false,
+            // so cur_p->data[*].p is unnormalized exp(logit - max_logit).
+            // Compute the actual normalized probability for the p_min gate.
+            float p_top_norm = 0.0f;
+            {
+                float sum_p = 0.0f;
+                for (size_t k = 0; k < cur_p->size; ++k) sum_p += cur_p->data[k].p;
+                if (sum_p > 0.0f) p_top_norm = cur_p->data[0].p / sum_p;
+            }
 
-            if (params.n_max <= (int) result.size()) {
+            // Bug B fix: check p_min BEFORE push_back (matches mainline order),
+            // so low-confidence drafts are not committed.
+            if (p_top_norm < params.p_min) {
                 break;
             }
 
-            // only collect very high-confidence draft tokens
-            if (cur_p->data[0].p < params.p_min) {
+            result.push_back(id);
+
+            if (params.n_max <= (int) result.size()) {
                 break;
             }
 
@@ -457,8 +475,12 @@ struct common_speculative_state_draft : public common_speculative_state {
                 result.resize(params.n_max);
             }
         }
-    }
 
+        // Bug B fix: if we did not produce at least n_min drafts, clear result
+        if ((int) result.size() < params.n_min) {
+            result.clear();
+        }
+    }
     void accept(uint16_t n_accepted) override {
         // noop
         GGML_UNUSED(n_accepted);
