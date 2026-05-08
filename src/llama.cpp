@@ -7206,12 +7206,17 @@ struct llama_data_read {
     // ON_DEVICE override (llama_data_read_device) replaces this with a single
     // bulk D2D copy from the per-seq mirror buffer staged at write time.
     //
-    // PR2 covers the non-split attention paths only; recurrent (s_l) and
-    // graph-split (tensor->extra != nullptr) call sites continue to use
-    // read(size) + ggml_backend_tensor_set directly. PR3 will lift those.
+    // PR3: ON_DEVICE now covers both attention and recurrent (s_l) layers.
+    // Graph-split tensors (tensor->extra != nullptr) still take the host-bounce
+    // path because their per-device split layout requires an aux buffer.
     virtual void read_tensor_data(struct ggml_tensor * tensor, size_t offset, size_t size, int /*il*/) {
         ggml_backend_tensor_set(tensor, read(size), offset, size);
     }
+
+    // Status flag set by ON_DEVICE read paths when the staged mirror buffer
+    // doesn't match the restore-time layout. The dispatch site reads this
+    // before returning so callers see a true zero-bytes-restored on failure.
+    bool ondevice_failed = false;
 
     void read_string(std::string & str) {
         uint32_t str_size;
@@ -7676,7 +7681,10 @@ struct llama_data_read {
                     if (kv_self.s_l[il]->extra) {
                         read_kv_cache_data_split(ctx, kv_self.s_l[il], read(s_data_size), s_dst_row, s_size_row, s_rows, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.s_l[il], read(s_data_size), s_dst_offset, s_data_size);
+                        // PR3: route recurrent rows through the virtual so the
+                        // ON_DEVICE override can stage a bulk D2D copy. The
+                        // host-fallback path keeps doing read+tensor_set.
+                        read_tensor_data(kv_self.s_l[il], s_dst_offset, s_data_size, il);
                     }
                 }
             }
@@ -7916,16 +7924,16 @@ struct llama_data_write_device : llama_data_write_buffer {
     }
 
     void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
-        // Recurrent layers and split-graph tensors stay on the host path.
-        // For recurrent layers (qnext s_l) the cache is small and indexed by
-        // seq_id row, so the host bounce is fine and PR3 will lift this.
-        if (tensor->extra || (il >= 0 && size_t(il) < model.hparams.recurrent_layer_arr.size()
-                              && model.hparams.recurrent_layer_arr[il])) {
+        // Split-graph tensors stay on the host path because their per-device
+        // split layout requires an aux buffer. Recurrent (s_l) layers, attn
+        // KV layers and any other non-split cache tensor go through the
+        // deferred D2D mirror.
+        if (tensor->extra) {
             llama_data_write_buffer::write_tensor_data(tensor, offset, size, il);
             return;
         }
 
-        // Non-split attention path: defer the actual D2D copy to the destructor.
+        // Non-split path: defer the actual D2D copy to the destructor.
         // We DON'T advance ptr / consume buf_size here — the on-device snapshot
         // buffer never holds the tensor bytes. We only bump size_written so
         // get_size_written() reflects the logical (host-equivalent) snapshot
@@ -8014,9 +8022,9 @@ struct llama_data_read_device : llama_data_read_buffer {
     }
 
     void read_tensor_data(struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
-        // Same guards as the write side: split / recurrent stays on host path.
-        if (tensor->extra || (il >= 0 && size_t(il) < model.hparams.recurrent_layer_arr.size()
-                              && model.hparams.recurrent_layer_arr[il])) {
+        // Same guard as the write side: split-graph tensors stay on the host
+        // path. Recurrent and attn cache tensors take the deferred D2D path.
+        if (tensor->extra) {
             llama_data_read::read_tensor_data(tensor, offset, size, il);
             return;
         }
@@ -8053,6 +8061,10 @@ struct llama_data_read_device : llama_data_read_buffer {
                         it == mbufs.end() ? size_t(0) : it->second.total_size,
                         mbuf.n_tensors,
                         mbuf.total_size);
+                // PR3 review polish: signal failure to the dispatch site so
+                // llama_state_seq_set_data returns 0 instead of a non-zero
+                // restored count when the D2D copy never happened.
+                ondevice_failed = true;
                 return;
             }
         }
@@ -8070,6 +8082,7 @@ struct llama_data_read_device : llama_data_read_buffer {
             if (i >= mbuf_cur.cpy.size() || i >= mbuf_cur.org.size()) {
                 LLAMA_LOG_ERROR("%s: on-device snapshot index OOB on buft '%s'\n",
                         __func__, ggml_backend_buft_name(buft));
+                ondevice_failed = true;
                 return;
             }
             // D2D copy from the staged mirror back into the live cache view.
@@ -8390,7 +8403,14 @@ size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src,
             data_ctx->read_to(&seq_read, sizeof(seq_read));
             (void)magic_read; (void)seq_read; // already validated above
         }
-        return llama_state_seq_set_data_internal(ctx, *data_ctx, dest_seq_id, flags);
+        const size_t n = llama_state_seq_set_data_internal(ctx, *data_ctx, dest_seq_id, flags);
+        // PR3 review polish: ON_DEVICE read paths set ondevice_failed when the
+        // staged mirror buffer doesn't match the restore-time layout. Returning
+        // 0 here makes llama_state_seq_set_data caller-checkable.
+        if (data_ctx->ondevice_failed) {
+            return 0;
+        }
+        return n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what());
         return 0;

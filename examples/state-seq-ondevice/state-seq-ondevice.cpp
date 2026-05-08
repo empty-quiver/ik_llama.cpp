@@ -1,7 +1,13 @@
-// PR2 demo for LLAMA_STATE_SEQ_FLAGS_ON_DEVICE on plain-transformer attention.
+// PR2/PR3 demo for LLAMA_STATE_SEQ_FLAGS_ON_DEVICE.
+//
+// PR2 covered non-hybrid attention only. PR3 lifts the recurrent-layer guard
+// in the device serializer, so this demo also passes bitwise on hybrid models
+// (e.g. Qwen3.5 0.8B drafter, Qwen3.5-MoE/27B). The flow is identical for
+// both arches — round-trip identity is what proves the qnext s_l rows are
+// staged + restored correctly through the ON_DEVICE D2D mirror path.
 //
 // Flow:
-//   1. Load a non-hybrid model.
+//   1. Load a model.
 //   2. Decode N=32 prompt tokens into seq 0.
 //   3. Snapshot via llama_state_seq_get_data(..., ON_DEVICE).
 //   4. Decode 8 more tokens (deterministic argmax on each step). Capture final
