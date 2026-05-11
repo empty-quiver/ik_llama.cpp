@@ -7308,6 +7308,23 @@ struct llama_data_read {
 
             llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
 
+            // Empty-slot restore: cell_count == 0 means the save captured no
+            // cells (a freshly-erased slot, or one that was never decoded).
+            // With cell_count=0, `llama_batch_init(0, 0, 1)` returns a batch
+            // backed by a malloc(0) allocation; the subsequent
+            // `llama_kv_cache_find_slot(batch)` returns true without writing
+            // any cells (its inner loop bounds on n_tokens=0); and the assert
+            // at the end of this function then reads `batch.pos[0]` from
+            // undefined memory. In practice the read returns heap garbage
+            // that fails the equality check against `cells[head].pos = -1`,
+            // aborting the process. The seq_rm above has already cleared any
+            // residual seq_id state, so it is safe to skip the find_slot /
+            // cell-meta loop entirely. Matches ggml-org/llama.cpp's post-2024
+            // KV-cache refactor (see upstream issue ggml-org/llama.cpp#9173).
+            if (cell_count == 0) {
+                return true;
+            }
+
             llama_batch batch = llama_batch_init(cell_count, 0, 1);
             batch.n_tokens = cell_count;
             for (uint32_t i = 0; i < cell_count; ++i) {
