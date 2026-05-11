@@ -2462,13 +2462,20 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                                       const std::string &               input,
                                       bool                              is_partial,
                                       const common_chat_parser_params & params) {
-    const common_peg_arena & parser = src_parser.empty() ?
-        build_chat_peg_parser([](common_chat_peg_builder & p) { return p.content(p.rest()) + p.end(); }) :
-        src_parser;
-
+    // Fix: bind the default parser to a named local. The previous form bound a
+    // ternary-temporary to a const reference, which is NOT lifetime-extended in
+    // a ?: between a prvalue and an lvalue — `parser` ended up dangling and
+    // `parser.parse()` read freed memory, surfacing as
+    // "Failed to parse input at pos 0" on /v1/completions (where src_parser is
+    // empty) and intermittent crashes elsewhere.
+    common_peg_arena default_parser;
     if (src_parser.empty()) {
+        default_parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+            return p.content(p.rest()) + p.end();
+        });
         LOG_DBG("No parser definition detected, assuming pure content parser.");
     }
+    const common_peg_arena & parser = src_parser.empty() ? default_parser : src_parser;
 
     const std::string effective_input = params.generation_prompt.empty()
         ? input

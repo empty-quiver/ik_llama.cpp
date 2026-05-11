@@ -635,10 +635,19 @@ result_timings server_slot::get_timings() const {
 const common_chat_msg& server_slot::update_chat_msg(bool is_partial, std::vector<common_chat_msg_diff>& diffs,
     bool filter_tool_calls) {
     auto msg_prv_copy = chat_msg;
-    auto new_msg = common_chat_parse(
-        generated_text,
-        /* is_partial= */ stop != STOP_TYPE_EOS,
-        params.chat_parser_params);
+    common_chat_msg new_msg;
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            /* is_partial= */ stop != STOP_TYPE_EOS,
+            params.chat_parser_params);
+    } catch (const std::exception & ex) {
+        // Defense-in-depth: a parser error must not abort the whole process.
+        // Log and keep the existing chat_msg so the request can finish; the
+        // generated text is still returned via the response content fields.
+        LLAMA_LOG_WARN("update_chat_msg: parse failed, keeping prior chat_msg: %s\n", ex.what());
+        return chat_msg;
+    }
     if (!new_msg.empty()) {
         //new_msg.ensure_tool_call_ids_set(generated_tool_call_ids, gen_tool_call_id);
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
